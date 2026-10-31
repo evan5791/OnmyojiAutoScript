@@ -1,3 +1,5 @@
+from unicodedata import normalize
+
 from pydantic import Field, BaseModel
 
 from tasks.Component.config_base import DateTime
@@ -22,14 +24,25 @@ class AccountInfo(BaseModel):
     last_complete_time: DateTime = Field(default=DateTime.fromisoformat("2023-01-01 00:00:00"), description="last_complete_time_help")
 
     def is_account_alias(self, ocr_account):
-        tmp_account = AccountInfo.preprocessAccount(self.account)
-        if ocr_account == self.account or ocr_account.startswith(tmp_account):
+        # 空账号不能成为任意 OCR 文本的前缀；英文账号忽略大小写和 OCR 空格。
+        if not self.account or not ocr_account:
+            return False
+        def clean(value):
+            return ''.join(normalize('NFKC', value).split()).casefold().replace('★', '*')
+
+        ocr_account = clean(ocr_account)
+        account = clean(self.account)
+        tmp_account = AccountInfo.preprocessAccount(account)
+        if not tmp_account or not ocr_account:
+            return False
+        if ocr_account == account or ('@' in account and ocr_account == tmp_account):
             return True
         if not self.account_alias:
             return False
         _accountAliasList = self.account_alias.split('#')
         for alias in _accountAliasList:
-            if ocr_account.startswith(alias):
+            alias = clean(alias)
+            if alias and ocr_account.startswith(alias):
                 return True
         return False
 

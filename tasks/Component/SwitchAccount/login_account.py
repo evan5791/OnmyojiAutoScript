@@ -2,10 +2,12 @@ import math
 import time
 
 import cv2
+
 from module.atom.click import RuleClick
 from module.atom.gif import RuleGif
 from module.atom.image import RuleImage
 from module.atom.ocr import RuleOcr
+from module.atom.swipe import RuleSwipe
 from module.logger import logger
 from tasks.Component.SwitchAccount.assets import SwitchAccountAssets
 from tasks.Component.SwitchAccount.switch_account_config import AccountInfo
@@ -39,7 +41,6 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
         lastSvrList: tuple = ()
         while 1:
             self.screenshot()
-            # 灰度图
             self.device.image = cv2.cvtColor(self.device.image, cv2.COLOR_BGR2GRAY)
             # ret, self.device.image = cv2.threshold(self.device.image, 200, 255, cv2.THRESH_OTSU)
             ret, self.device.image = cv2.threshold(self.device.image, 100, 255, cv2.THRESH_BINARY)
@@ -48,6 +49,7 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
 
             # RGB图
             self.device.image = cv2.cvtColor(self.device.image, cv2.COLOR_GRAY2RGB)
+
 
             ocrRes = self.O_SA_SELECT_SVR_SVR_LIST.detect_and_ocr(self.device.image)
             # 受限于图像识别文字准确率,此处对识别结果与实际服务器名字 进行检查 字重合度大于阈值 就认为查找成功
@@ -162,12 +164,21 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
         logger.info("start selectAccount")
         self.O_SA_ACCOUNT_ACCOUNT_LIST.keyword = accountInfo.account
         self.O_SA_ACCOUNT_ACCOUNT_SELECTED.keyword = accountInfo.account
-        # 正常情况一次就行,但防不住OCR搞幺蛾子 保险起见 多来几次吧 反正挂机不差这点
+        # 多账号列表可能保留上次滚动位置；到达边界后反向回扫，补偿 OCR 漏识别。
+        reverse_swipe = RuleSwipe(
+            roi_front=self.S_SA_ACCOUNT_LIST_UP.roi_back,
+            roi_back=self.S_SA_ACCOUNT_LIST_UP.roi_front,
+            mode=self.S_SA_ACCOUNT_LIST_UP.mode,
+            name='sa_account_list_down',
+        )
         for i in range(3):
-            while 1:
+            previous_page = None
+            swipe = self.S_SA_ACCOUNT_LIST_UP if i % 2 == 0 else reverse_swipe
+            for _ in range(15):
                 self.screenshot()
                 if self.appear(self.I_SA_ACCOUNT_DROP_DOWN_CLOSED):
-                    if self.ocr_appear(self.O_SA_ACCOUNT_ACCOUNT_SELECTED):
+                    selected = self.O_SA_ACCOUNT_ACCOUNT_SELECTED.ocr_single(self.device.image)
+                    if accountInfo.is_account_alias(selected):
                         return True
                     self.ui_click_until_disappear(self.I_SA_ACCOUNT_DROP_DOWN_CLOSED,
                                                   interval=1.5)
@@ -175,9 +186,10 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
 
                 # 账号列表已打开状态
                 ocrRes = self.O_SA_ACCOUNT_ACCOUNT_LIST.detect_and_ocr(self.device.image)
+                account_names = tuple(item.ocr_text for item in ocrRes)
 
                 # 找到该账号
-                for index, ocr_account in enumerate([ocrResItem.ocr_text for ocrResItem in ocrRes]):
+                for index, ocr_account in enumerate(account_names):
                     if not accountInfo.is_account_alias(ocr_account):
                         continue
                     # if accountInfo.account in [ocrResItem.ocr_text for ocrResItem in ocrRes]:
@@ -196,10 +208,15 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
                     return True
 
                 # 未找到该账号
-                if self.appear(self.I_SA_ACCOUNT_DROP_DOWN_ADD_ACCOUNT):
+                if account_names and account_names == previous_page:
                     break
-                self.swipe(self.S_SA_ACCOUNT_LIST_UP, 1.5)
-                time.sleep(0.5)
+                previous_page = account_names
+                if i % 2 == 0 and self.appear(self.I_SA_ACCOUNT_DROP_DOWN_ADD_ACCOUNT):
+                    break
+                # Each iteration already waits for the drag animation. A second
+                # cooldown can suppress the drag and mimic the end of the list.
+                self.swipe(swipe)
+                time.sleep(0.8)
         logger.info("account [ %s ] not found ", accountInfo.account)
         return False
 
@@ -264,7 +281,8 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
                     logger.error("param account is None,cannot switch account")
                     return False
                 # 当前选择账号不是account
-                if not self.ocr_appear(self.O_SA_ACCOUNT_ACCOUNT_SELECTED):
+                selected = self.O_SA_ACCOUNT_ACCOUNT_SELECTED.ocr_single(self.device.image)
+                if not accountInfo.is_account_alias(selected):
                     # 没有找到account
                     if not self.selectAccount(accountInfo):
                         self.ui_click_until_disappear(self.C_SA_LOGIN_FORM_ACCOUNT_CLOSE_BTN,
@@ -297,6 +315,10 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
                     self.click(self.C_SA_LOGIN_FORM_USER_CENTER)
                     continue
 
+                # 同区切号只配置账号即可，沿用账号记忆的区服，不进入角色/区服选择。
+                if not accountInfo.character:
+                    isCharacterSelected = True
+                    break
                 # 已登录 查找对应角色
                 if not isCharacterSelected and self.switch_character(accountInfo.character):
                     isCharacterSelected = True

@@ -71,6 +71,7 @@ from tasks.GoryouRealm.config import GoryouRealm
 from tasks.Hyakkiyakou.config import Hyakkiyakou
 from tasks.HeroTest.config import HeroTest
 from tasks.FindJade.config import FindJade
+from tasks.AccountSwitch.config import AccountSwitch
 from tasks.MemoryScrolls.config import MemoryScrolls
 # ----------------------------------------------------------------------------------------------------------------------
 
@@ -135,6 +136,7 @@ class ConfigModel(ConfigBase):
     hyakkiyakou: Hyakkiyakou = Field(default_factory=Hyakkiyakou)
     hero_test: HeroTest = Field(default_factory=HeroTest)
     find_jade: FindJade = Field(default_factory=FindJade)
+    account_switch: AccountSwitch = Field(default_factory=AccountSwitch)
     memory_scrolls: MemoryScrolls = Field(default_factory=MemoryScrolls)
 
     # 这些是每周任务
@@ -350,6 +352,8 @@ class ConfigModel(ConfigBase):
 
         result: dict[str, list] = {}
         for key, value in task.model_dump(context={'hide': True}).items():
+            if value == 0xABCDEF:
+                continue
             if key not in groups:
                 for group_name in groups.keys():
                     if group_name in key:
