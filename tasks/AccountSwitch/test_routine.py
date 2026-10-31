@@ -196,8 +196,10 @@ class RoutineWorkflowTests(unittest.TestCase):
         task = ScriptTask.__new__(ScriptTask)
         model = saved or AccountSwitch(account_switch_config=AccountSwitchConfig(
             accounts='\n'.join(f'alt{index:02d}@163.com' for index in range(1, count + 1)),
-            invite_friend_name='5791', routine_enable=True,
+            invite_friend_name='5791', assist_friend='5791', routine_enable=True,
+            daytime_jitter_minutes=0, evening_jitter_minutes=0, ios_daily_jitter_minutes=0,
         ))
+        model.runtime.schedule.setdefault('service:android', {'armed_at': '2026-10-30T00:00:00'})
         task.config = SimpleNamespace(account_switch=model, save=Mock())
         task.device = object()
         task.goto_page = Mock()
@@ -208,7 +210,7 @@ class RoutineWorkflowTests(unittest.TestCase):
         task.config.save.side_effect = lambda: self.snapshots.append(AccountSwitch.model_validate_json(model.model_dump_json()))
         return task
 
-    def execute(self, task, now, jade_results=None, daily=None, awakening=None, login=None, clock_state=None):
+    def execute(self, task, now, jade_results=None, daily=None, awakening=None, login=None, clock_state=None, batch_platform=None):
         jade_results = iter(jade_results or [SimpleNamespace(status='completed', pending=None, reason='')])
 
         def switch(config, device, account):
@@ -225,14 +227,14 @@ class RoutineWorkflowTests(unittest.TestCase):
                 on_checkpoint(result.pending)
             return result
 
-        def daily_default(config, device, record, on_progress=None, routine_day=None):
+        def daily_default(config, device, record, on_progress=None, routine_day=None, **kwargs):
             self.events.append(('daily', self.current_account, routine_day))
             record = record.model_copy(deep=True)
             record.pickup_email_dt = now
             on_progress(record)
             return SimpleNamespace(done_record=record, success=True, pending=())
 
-        def awakening_default(config, device, layer=1, count=14, on_progress=None):
+        def awakening_default(config, device, layer=1, count=14, on_progress=None, **kwargs):
             self.events.append(('awakening', self.current_account, layer, count))
             on_progress(count)
             return SimpleNamespace(requested=count, completed=count, success=True)
@@ -242,14 +244,20 @@ class RoutineWorkflowTests(unittest.TestCase):
                 patch('tasks.AccountSwitch.flows.run_daily', side_effect=daily or daily_default) as daily_flow, \
                 patch('tasks.AccountSwitch.flows.run_awakening', side_effect=awakening or awakening_default) as awakening_flow, \
                 patch('tasks.AccountSwitch.jade.JadeCooperationTask') as jade_task, \
+                patch('tasks.AccountSwitch.cooperation.prepare_cooperation_assist',
+                      return_value=SimpleNamespace(friend='5791',normal_used=0,card_used=0)), \
                 patch('tasks.AccountSwitch.script_task.logger'):
             if clock_state is None:
                 clock.now.return_value = now
             else:
                 clock.now.side_effect = lambda: clock_state['now']
             jade_task.return_value.run_jade.side_effect = jade
-            with self.assertRaises(TaskEnd):
-                task.run()
+            if batch_platform:
+                settings = task.config.account_switch.account_switch_config
+                task.run_account_batch(settings, settings.get_account_rows(), batch_platform, settings.invite_friend_name or '5791')
+            else:
+                with self.assertRaises(TaskEnd):
+                    task.run()
         return switches, daily_flow, awakening_flow, jade_task
 
     @staticmethod
@@ -341,7 +349,7 @@ class RoutineWorkflowTests(unittest.TestCase):
         self.assertEqual(task.config.task_runtime_outcome['status'], 'account_routine_pending')
         self.assertEqual(slot.owner_account, 'alt01@163.com|android')
         self.assertEqual(slot.pending, {'stage': 'sent', 'quest_slot': 1})
-        self.assertTrue(any(snapshot.runtime.periods[refresh_period(now).key('5791')].pending for snapshot in self.snapshots))
+        self.assertTrue(any(snapshot.runtime.periods[refresh_period(now).key('5791')].pending for snapshot in self.snapshots if refresh_period(now).key('5791') in snapshot.runtime.periods))
         task.set_next_run.assert_called_once_with('AccountSwitch', target=datetime(2026, 10, 31, 20, 10), server=False)
 
     def test_restart_resumes_pending_owner_first_without_repeating_finished_daily_work(self):
@@ -369,7 +377,7 @@ class RoutineWorkflowTests(unittest.TestCase):
         runtime.periods[refresh_period(now).key('5791')] = JadePeriodProgress(completed=True)
         runtime.accounts['alt01@163.com|android'] = AccountRoutineProgress(day='2026-10-31', daily_done=True, awakening_completed=6)
 
-        def awakening(config, device, layer, count, on_progress):
+        def awakening(config, device, layer, count, on_progress, **kwargs):
             self.events.append(('awakening', self.current_account, layer, count))
             if self.current_account == 'alt01@163.com':
                 on_progress(4)
@@ -389,7 +397,7 @@ class RoutineWorkflowTests(unittest.TestCase):
         task = self.make_task(count=1)
         now = datetime(2026, 10, 31, 20)
 
-        def partial(config, device, layer, count, on_progress):
+        def partial(config, device, layer, count, on_progress, **kwargs):
             on_progress(5)
             return SimpleNamespace(requested=count, completed=5, success=False)
 
@@ -427,12 +435,12 @@ class RoutineWorkflowTests(unittest.TestCase):
     def test_checkpoint_remains_saved_when_a_battle_requires_human_takeover(self):
         task = self.make_task(count=1)
 
-        def interrupted(config, device, layer, count, on_progress):
+        def interrupted(config, device, layer, count, on_progress, **kwargs):
             on_progress(4)
             raise RequestHumanTakeover('battle interrupted')
 
-        with self.assertRaisesRegex(RequestHumanTakeover, 'battle interrupted'):
-            self.execute(task, datetime(2026, 10, 31, 20), awakening=interrupted)
+        self.execute(task, datetime(2026, 10, 31, 20), awakening=interrupted)
+        self.assertEqual(task.config.task_runtime_outcome['status'], 'account_routine_pending')
         self.assertTrue(self.snapshots[-1].runtime.accounts['alt01@163.com|android'].daily_done)
         self.assertEqual(self.snapshots[-1].runtime.accounts['alt01@163.com|android'].awakening_completed, 4)
 
@@ -443,7 +451,9 @@ class RoutineWorkflowTests(unittest.TestCase):
         restored = AccountSwitch.model_validate_json(task.config.account_switch.model_dump_json())
         restored.account_switch_config.invite_friend_name = '另一个大号'
         task = self.make_task(saved=restored)
-        _, daily, awakening, jade = self.execute(task, datetime(2026, 10, 31, 20, 20))
+        # Explicit batch continuation can service a changed recipient without
+        # reopening a finished scheduled window or replaying daily checkpoints.
+        _, daily, awakening, jade = self.execute(task, datetime(2026, 10, 31, 20, 20), batch_platform='android')
         daily.assert_not_called()
         awakening.assert_not_called()
         self.assertEqual(jade.call_count, 1)
@@ -478,7 +488,7 @@ class RoutineWorkflowTests(unittest.TestCase):
         now = datetime(2026, 10, 31, 20)
         clock_state = {'now': now}
 
-        def daily(config, device, record, on_progress, routine_day):
+        def daily(config, device, record, on_progress, routine_day, **kwargs):
             self.assertEqual(routine_day, '2026-10-31')
             clock_state['now'] = datetime(2026, 11, 1, 6, 1)
             on_progress(record)
@@ -486,7 +496,7 @@ class RoutineWorkflowTests(unittest.TestCase):
 
         _, daily_flow, awakening, jade = self.execute(task, now, daily=daily, clock_state=clock_state)
         self.assertEqual(daily_flow.call_count, 1)
-        self.assertEqual(awakening.call_count, 1)
+        awakening.assert_not_called()
         jade.assert_not_called()
         self.assertFalse(self.period_state(task, now).completed)
         self.assertEqual(task.config.account_switch.runtime.accounts['alt01@163.com|android'].day, '2026-10-31')

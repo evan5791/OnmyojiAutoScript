@@ -1,6 +1,7 @@
 ### AzurLaneAutoScript
 log
 config/backup/*
+config/*.alt-migration-*/
 config/*.ini
 !config/template.ini
 config/*.yaml

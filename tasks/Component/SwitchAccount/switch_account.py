@@ -8,15 +8,27 @@ from tasks.Component.SwitchAccount.assets import SwitchAccountAssets
 from tasks.Component.SwitchAccount.exit_game import ExitGame
 from tasks.Component.SwitchAccount.login_account import LoginAccount
 from tasks.Component.SwitchAccount.switch_account_config import AccountInfo
-from tasks.Restart.login import LoginHandler
+from tasks.Restart.login import LoginHandler as OriginalLoginHandler
+from tasks.AccountSwitch.dialogs import AccountDialogGuard
 from tasks.Restart.assets import RestartAssets
 from tasks.GameUi.game_ui import GameUi
 from tasks.GameUi.page import page_main, page_login
+from tasks.GameUi.matcher import all_of
 
 from module.logger import logger
 
 
-class SwitchAccount(LoginAccount, ExitGame, GameUi, SwitchAccountAssets):
+class LoginHandler(AccountDialogGuard,OriginalLoginHandler):
+    pass
+
+
+class SwitchAccount(AccountDialogGuard,LoginAccount, ExitGame, GameUi, SwitchAccountAssets):
+    DEFAULT_UNKNOWN_CLOSERS=[GameUi.I_UI_BACK_RED,GameUi.I_UI_BACK_BLUE,GameUi.I_UI_BACK_YELLOW]
+
+    def _sdk_visible(self):
+        if getattr(self.device,'image',None) is None:return False
+        return any(self.appear(rule) for rule in (self.I_SA_NETEASE_GAME_LOGO,self.I_SA_ACCOUNT_DROP_DOWN_CLOSED,
+                                                 self.I_SA_LOGIN_FORM_APPLE,self.I_SA_SWITCH_ACCOUNT_BTN))
     I_ACCOUNT_CANCEL_BIND_PHONE = RuleImage(
         roi_front=(450, 460, 160, 100), roi_back=(450, 460, 160, 100),
         threshold=0.8, method='Template matching',
@@ -36,6 +48,8 @@ class SwitchAccount(LoginAccount, ExitGame, GameUi, SwitchAccountAssets):
         @type frm:
         """
         super().__init__(config, device)
+        main=self.navigator.pages[page_main.key]
+        main.recognizer=all_of(main.recognizer,lambda task:not task._sdk_visible())
         self.to_account_info = to
         self.from_account_info = frm
 
@@ -44,7 +58,7 @@ class SwitchAccount(LoginAccount, ExitGame, GameUi, SwitchAccountAssets):
         # 判断所处界面
         self.screenshot()
         self.handle_bind_phone_popup()
-        curPage = self.get_current_page()
+        curPage = page_login if self._sdk_visible() else self.get_current_page()
 
         if curPage != page_login and curPage != page_main:
             self.goto_page(page_main)
@@ -63,6 +77,8 @@ class SwitchAccount(LoginAccount, ExitGame, GameUi, SwitchAccountAssets):
         # 登录弹窗处理结束后，确认已进入庭院才允许触发后续任务。
         self.goto_page(page_main)
         self.handle_bind_phone_popup()
+        if self._sdk_visible():
+            raise RequestHumanTakeover('SDK遮挡庭院，未确认登录完成')
         return True
 
     def handle_bind_phone_popup(self):

@@ -39,6 +39,7 @@ from module.logger import logger
 from module.exception import *
 from module.server.i18n import I18n
 from module.ocr.rpc import ensure_ocr_server_started
+from tasks.AccountSwitch import service as account_service
 
 
 
@@ -379,7 +380,8 @@ class Script:
         logger.info(f"[Queue] '{self.config_name}' waiting for execution token...")
         if (self.config.script.optimization.when_task_queue_empty == 'close_game'
                 and not self._emulator_down
-                and 'device' in self.__dict__):
+                and 'device' in self.__dict__
+                and not account_service.preserve_vm(self.config)):
             try:
                 self.device.emulator_stop()
                 self._emulator_down = True
@@ -403,6 +405,14 @@ class Script:
         :param next_run: 下一个任务的时间
         :return: True 表示等待成功完成, False 表示等待被中断
         """
+        if account_service.preserve_vm(self.config):
+            logger.info('小号任务尚未完成，等待期间保留模拟器，不执行关闭或返回庭院')
+            if self._emulator_down or 'device' not in self.__dict__:
+                return self.wait_until(next_run)
+            return self._wait_stay_there(next_run)
+        if account_service.initial_future_wait(self.config) and 'device' not in self.__dict__:
+            logger.info('小号未来计划尚未到点，不因小号等待额外初始化设备')
+            return self.wait_until(next_run)
         method = self.config.script.optimization.when_task_queue_empty
         strategy_map = {
             "close_game": self._wait_close_game,
@@ -545,27 +555,42 @@ class Script:
         if command == 'start' or command == 'goto_main':
             logger.error(f'Invalid command `{command}`')
 
+        if command != 'AccountSwitch':
+            account_service.clear_outcome(self.config)
+
         if not self._try_acquire_queue_token():
             return False
 
         if self.instance_guard and self.instance_guard.token_lost:
-            logger.warning(f'Token lost, stopping emulator and rejoining queue')
-            try:
-                self.device.emulator_stop()
-            except Exception:
-                pass
-            self._emulator_down = True
+            if account_service.preserve_vm(self.config):
+                logger.warning('小号任务未完成，执行权丢失时保留模拟器并重新排队')
+            else:
+                logger.warning(f'Token lost, stopping emulator and rejoining queue')
+                try:
+                    self.device.emulator_stop()
+                except Exception:
+                    pass
+                self._emulator_down = True
             self.instance_guard.release()
             return False
 
         try:
-            self.device.screenshot()
-            module_name = 'script_task'
-            module_path = str(Path.cwd() / 'tasks' / command / (module_name+'.py'))
-            logger.info(f'module_path: {module_path}, module_name: {module_name}')
-            task_module = load_module(module_name, module_path)
-            task_module.ScriptTask(config=self.config, device=self.device).run()
+            try:
+                self.device.screenshot()
+                module_name = 'script_task'
+                module_path = str(Path.cwd() / 'tasks' / command / (module_name+'.py'))
+                logger.info(f'module_path: {module_path}, module_name: {module_name}')
+                task_module = load_module(module_name, module_path)
+                task_module.ScriptTask(config=self.config, device=self.device).run()
+                if command == 'AccountSwitch':
+                    account_service.remember_outcome(self.config)
+            except Exception as error:
+                if command == 'AccountSwitch' and account_service.handle_failure(self.config, error, logger=logger):
+                    return True
+                raise
         except TaskEnd:
+            if command == 'AccountSwitch':
+                account_service.remember_outcome(self.config)
             return True
         except GameNotRunningError as e:
             logger.warning(e)
@@ -630,6 +655,7 @@ class Script:
         start_day = date.today()
         logger.info(f'Start scheduler loop: {self.config_name}')
         self.config.model.running_task = ''
+        account_service.arm_service(self.config, logger=logger)
         self.anti_ban_guard.reset()
 
         # Update GUI 防呆, 读取设置并立刻显示后台模拟器到前台
@@ -724,7 +750,7 @@ class Script:
                     content=f"<{self.config_name}> 任务连续失败三次，请上线查看"
                 )
                 # 关闭模拟器
-                if self.config.script.error.error_repeated:
+                if self.config.script.error.error_repeated and not account_service.preserve_vm(self.config):
                     self.device.emulator_stop()
                 exit(1)
 

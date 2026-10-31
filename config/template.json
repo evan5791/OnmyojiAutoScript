@@ -1600,21 +1600,34 @@
     },
     "account_switch_config": {
       "accounts": "",
+      "account_modes": "{}",
+      "account_targets": "{}",
       "apple_or_android": true,
       "auto_jade": false,
       "invite_friend_name": "",
+      "jade_receiver": "",
+      "assist_friend": "",
       "routine_enable": false,
+      "ios_daily_enable": false,
+      "ios_daily_run_time": "20:00:00",
+      "platform_priority": "android",
       "daily_courtyard_affairs": true,
       "daily_pickup_email": true,
+      "daily_free_options": "{}",
       "daytime_run_time": "17:00:00",
       "evening_run_time": "20:00:00",
+      "daytime_jitter_minutes": 15,
+      "evening_jitter_minutes": 15,
+      "ios_daily_jitter_minutes": 15,
       "awakening_layer": 1,
       "awakening_count": 14,
+      "awakening_kirin": "lightning",
       "retry_minutes": 10
     },
     "runtime": {
       "accounts": {},
-      "periods": {}
+      "periods": {},
+      "schedule": {}
     }
   }
 }

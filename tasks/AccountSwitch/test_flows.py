@@ -2,17 +2,19 @@ from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+from pydantic import BaseModel
 
 from module.exception import GameStuckError, TaskEnd
 from tasks.AccountSwitch.flows import (
     AccountAwakeningTask, AccountDailyTask, AwakeningResult, IsolatedConfig,
     _RoutineDailyConfig, click_until_gone, run_awakening, run_daily, wait_for,
+    battle_wait_options,
 )
 from tasks.AccountSwitch.config import AccountSwitch, DoneRecord
 from tasks.DailyTrifles.config import DailyTrifles
 from tasks.DailyTrifles.script_task import ScriptTask as DailyTask
 from tasks.EvoZone.config import EvoZone, Layer, UserStatus
-from tasks.Component.GeneralBattle.battle_wait import battle_wait_options
+from tasks.AccountSwitch.assist import AssistSelection,AssistProof,AssistError
 
 
 def make_config():
@@ -145,15 +147,15 @@ class DailyFlowTests(unittest.TestCase):
         self.assertEqual(config.daily_trifles.done_record.pickup_email_dt.year, 2023)
         config.save.assert_not_called()
 
-    def test_routine_record_survives_midnight_but_not_the_next_evening(self):
+    def test_routine_record_survives_midnight_but_not_the_next_six_oclock(self):
         routine_day = date(2026, 10, 31)
         daily = _RoutineDailyConfig()
         daily._routine_day = routine_day
         for completed_at, expected in [
-            (datetime(2026, 10, 31, 17, 59), False),
-            (datetime(2026, 10, 31, 18, 0), True),
+            (datetime(2026, 10, 31, 5, 59), False),
+            (datetime(2026, 10, 31, 6, 0), True),
             (datetime(2026, 11, 1, 0, 5), True),
-            (datetime(2026, 11, 1, 18, 0), False),
+            (datetime(2026, 11, 1, 6, 0), False),
         ]:
             with self.subTest(completed_at=completed_at):
                 daily.done_record.pickup_email_dt = completed_at
@@ -323,6 +325,7 @@ class AwakeningFlowTests(unittest.TestCase):
         self.assertEqual(progress, list(range(1, 15)))
         self.assertEqual(task.run_general_battle.call_count, 14)
 
+    @unittest.skipIf(battle_wait_options is None, 'Legacy battle hooks are not installed')
     def test_legacy_battle_signature_and_global_hook_options_are_isolated(self):
         task = self.make_task([])
 
@@ -426,6 +429,175 @@ class AwakeningFlowTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         run_awakening(make_config(), object(), layer=layer, count=count)
         task.assert_not_called()
+
+
+class ModernBattleLifecycleTests(unittest.TestCase):
+    def make_task(self, won=True, timeout=-1):
+        task=AwakeningFlowTests().make_task([])
+        class NativeConfig(BaseModel):
+            battle_timeout:int=-1
+            continuous_battle:bool=True
+            max_continuous:int=5
+            quick_exit:bool=True
+            preset_enable:bool=True
+            green_enable:bool=True
+            lock_team_enable:bool=False
+        task.config.evo_zone.general_battle_config=NativeConfig(battle_timeout=timeout)
+        def battle(config=None,buff=None,battle_key='default',exit_matcher=None):
+            self.assertIs(exit_matcher,task.I_EVOZONE_FIRE)
+            self.assertEqual(battle_key,'account_switch_awakening')
+            self.assertFalse(config.preset_enable)
+            self.assertFalse(config.green_enable)
+            self.assertTrue(config.lock_team_enable)
+            self.assertFalse(config.continuous_battle)
+            self.assertFalse(config.quick_exit)
+            self.assertEqual(config.max_continuous,0)
+            self.assertGreater(config.battle_timeout,0)
+            task.called_config=config
+            return won
+        task.run_general_battle=Mock(side_effect=battle)
+        return task
+
+    def test_modern_signature_uses_native_context_and_keeps_parent_config(self):
+        task=self.make_task();original=task.config.evo_zone.general_battle_config
+        wins=[]
+        with patch('tasks.AccountSwitch.flows.battle_wait_options',None), \
+                patch('tasks.AccountSwitch.flows.wait_for',return_value=True), \
+                patch('tasks.AccountSwitch.flows.click_until_gone',return_value=True):
+            result=task.run_counted(1,wins.append)
+        self.assertTrue(result.success);self.assertEqual(wins,[1])
+        self.assertEqual(task.called_config.battle_timeout,420)
+        self.assertEqual(original.battle_timeout,-1)
+        self.assertTrue(original.preset_enable);self.assertTrue(original.continuous_battle)
+
+    def test_modern_positive_native_timeout_is_preserved(self):
+        task=self.make_task(timeout=37)
+        with patch('tasks.AccountSwitch.flows.battle_wait_options',None):
+            self.assertTrue(task._run_account_battle(task.config.evo_zone.general_battle_config))
+        self.assertEqual(task.called_config.battle_timeout,37)
+
+    def test_win_without_return_to_challenge_is_not_checkpointed(self):
+        task=self.make_task();wins=[]
+        with patch('tasks.AccountSwitch.flows.battle_wait_options',None), \
+                patch('tasks.AccountSwitch.flows.wait_for',side_effect=[True,False]), \
+                patch('tasks.AccountSwitch.flows.click_until_gone',return_value=True):
+            result=task.run_counted(1,wins.append)
+        self.assertFalse(result.success);self.assertEqual(result.completed,0)
+        self.assertEqual(result.reason,'battle_return_unconfirmed');self.assertEqual(wins,[])
+
+    def test_modern_loss_does_not_increment_or_retry_inside_the_call(self):
+        task=self.make_task(won=False);wins=[]
+        with patch('tasks.AccountSwitch.flows.battle_wait_options',None), \
+                patch('tasks.AccountSwitch.flows.wait_for',return_value=True), \
+                patch('tasks.AccountSwitch.flows.click_until_gone',return_value=True):
+            result=task.run_counted(14,wins.append)
+        self.assertFalse(result.success);self.assertEqual(result.reason,'battle_lost')
+        self.assertEqual(result.completed,0);self.assertEqual(wins,[])
+        task.run_general_battle.assert_called_once()
+
+
+class ModernDailyLifecycleTests(unittest.TestCase):
+    def test_modern_daily_actions_are_used_when_login_harvest_was_removed(self):
+        for name,harvest,record in (
+                ('courtyard_affairs','harvest_courtyard_affairs','courtyard_affairs_dt'),
+                ('pickup_email','harvest_mail','pickup_email_dt')):
+            with self.subTest(name=name):
+                task=AccountDailyTask.__new__(AccountDailyTask)
+                task.config=make_config()
+                before=getattr(task.config.daily_trifles.done_record,record)
+                with patch.object(AccountDailyTask,harvest,None), \
+                        patch.object(DailyTask,'run_'+name,create=True) as native:
+                    getattr(task,'run_'+name)()
+                native.assert_called_once_with()
+                # Only the native implementation may confirm its completion.
+                self.assertEqual(getattr(task.config.daily_trifles.done_record,record),before)
+                task.config.save.assert_called_once()
+
+    def test_missing_native_friend_love_is_left_pending(self):
+        task=AccountDailyTask.__new__(AccountDailyTask)
+        task.config=make_config();before=task.config.daily_trifles.done_record.friend_love_dt
+        with patch.object(DailyTask,'run_friend_love',None):
+            task.run_friend_love()
+        self.assertEqual(task.config.daily_trifles.done_record.friend_love_dt,before)
+
+
+class MigratedConfirmationTests(unittest.TestCase):
+    def test_imported_partial_bool_skips_work_without_fabricating_a_done_time(self):
+        config=make_config();original=DoneRecord()
+        with patch('tasks.AccountSwitch.flows.AccountDailyTask') as task:
+            task.return_value.run.side_effect=TaskEnd
+            result=run_daily(config,object(),original,routine_day='2026-10-31',confirmed={'pickup_email':True})
+        self.assertTrue(result.success)
+        self.assertTrue(result.confirmed['pickup_email'])
+        self.assertEqual(result.done_record.pickup_email_dt,original.pickup_email_dt)
+
+    def test_free_daily_overrides_only_change_the_private_selected_options(self):
+        config=make_config();before=config.daily_trifles.model_dump()
+        config.account_switch=SimpleNamespace(account_switch_config=SimpleNamespace(
+            daily_courtyard_affairs=False,daily_pickup_email=True,
+            get_daily_free_options=lambda:{'friend_love':False,'luck_msg':True,'store_sign':True}))
+        def factory(private,device):
+            options=private.daily_trifles.trifles_config
+            self.assertFalse(options.friend_love);self.assertTrue(options.luck_msg);self.assertTrue(options.store_sign)
+            return SimpleNamespace(run=Mock(side_effect=TaskEnd))
+        with patch('tasks.AccountSwitch.flows.AccountDailyTask',side_effect=factory):
+            result=run_daily(config,object(),DoneRecord(),confirmed={'pickup_email':True,'luck_msg':True,'store_sign':True})
+        self.assertTrue(result.success)
+        self.assertEqual(config.daily_trifles.model_dump(),before)
+
+
+class NativeAssistedAwakeningTests(unittest.TestCase):
+    def setUp(self):
+        self.task=AccountAwakeningTask.__new__(AccountAwakeningTask)
+        self.task.config=SimpleNamespace(evo_zone=EvoZone())
+        self.task.goto_page=Mock();self.task.evozone_enter=Mock(return_value=True)
+        self.task._select_account_layer=Mock(return_value=True);self.task.check_lock=Mock(return_value=True)
+        self.task.run_general_battle=Mock(return_value=True)
+        self.task.appear=Mock(return_value=False)
+        for name in ('wait_for','click_until_gone'):
+            patcher=patch('tasks.AccountSwitch.flows.'+name,return_value=True)
+            patcher.start();self.addCleanup(patcher.stop)
+        self.selection=AssistSelection('friend',0)
+        self.proof_patch=patch('tasks.AccountSwitch.flows.prepare_battle_assist',return_value=AssistProof(0,0,True))
+        self.proof=self.proof_patch.start();self.addCleanup(self.proof_patch.stop)
+        self.leave_patch=patch('tasks.AccountSwitch.flows.leave_preparation',return_value=True)
+        self.leave=self.leave_patch.start();self.addCleanup(self.leave_patch.stop)
+
+    def test_fourteen_skip_still_verifies_a_zero_remaining_request(self):
+        self.selection=AssistSelection('friend',14);self.proof.return_value=AssistProof(14,14,False)
+        result=self.task.run_counted(0,None,assist=self.selection)
+        self.assertTrue(result.success);self.assertTrue(result.assist_verified);self.assertTrue(result.daily_target_reached)
+        self.assertEqual(result.completed,0);self.proof.assert_called_once();self.leave.assert_called_once()
+        self.task.run_general_battle.assert_not_called()
+
+    def test_mismatched_counts_abandon_preparation_without_battle(self):
+        self.proof.side_effect=AssistError('assist_count_mismatch')
+        result=self.task.run_counted(14,None,assist=self.selection)
+        self.assertFalse(result.success);self.assertEqual(result.completed,0)
+        self.task.run_general_battle.assert_not_called();self.leave.assert_called_once()
+
+    def test_custom_target_is_capped_before_a_fifteenth_use(self):
+        self.selection=AssistSelection('friend',13);self.proof.return_value=AssistProof(13,13,True)
+        wins=[];result=self.task.run_counted(100,wins.append,assist=self.selection)
+        self.assertEqual(result.completed,1);self.assertTrue(result.daily_target_reached)
+        self.assertEqual(wins,[1]);self.task.run_general_battle.assert_called_once()
+
+    def test_only_real_settled_wins_checkpoint_on_partial_failure(self):
+        self.proof.return_value=AssistProof(5,5,True)
+        self.task.run_general_battle.side_effect=[True,False]
+        wins=[];result=self.task.run_counted(9,wins.append,assist=AssistSelection('friend',5))
+        self.assertFalse(result.success);self.assertEqual(result.completed,1);self.assertEqual(wins,[1])
+        self.assertTrue(result.assist_verified);self.assertFalse(result.daily_target_reached)
+
+    def test_zero_with_a_low_counter_never_claims_the_daily_target_complete(self):
+        result=self.task.run_counted(0,None,assist=self.selection)
+        self.assertFalse(result.success);self.assertFalse(result.daily_target_reached)
+        self.task.run_general_battle.assert_not_called()
+
+    def test_relock_failure_preserves_the_first_confirmed_win(self):
+        self.task.check_lock.side_effect=[True,False]
+        wins=[];result=self.task.run_counted(14,wins.append,assist=self.selection)
+        self.assertFalse(result.success);self.assertEqual(result.completed,1);self.assertEqual(wins,[1])
 
 
 class AwakeningLayerTests(unittest.TestCase):

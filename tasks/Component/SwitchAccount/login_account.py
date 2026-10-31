@@ -1,5 +1,6 @@
 import math
 import time
+from unicodedata import normalize
 
 import cv2
 
@@ -14,7 +15,66 @@ from tasks.Component.SwitchAccount.switch_account_config import AccountInfo
 from tasks.base_task import BaseTask
 
 
+def exact_account_matches(info, value):
+    def clean(item):return ''.join(normalize('NFKC',str(item or '')).split()).casefold().replace('★','*')
+    account,found=clean(info.account),clean(value)
+    if not account or not account.split('@',1)[0] or not found:return False
+    choices={account}
+    if '@' in account:choices.add(account.split('@',1)[0])
+    choices.update(clean(alias) for alias in info.account_alias.split('#') if clean(alias))
+    return found in choices
+
+
 class LoginAccount(BaseTask, SwitchAccountAssets):
+
+    def _wait_selected_account(self,accountInfo: AccountInfo,*,timeout=15,confirm_frames=2):
+        """Wait for a closed SDK card and stable exact identity on fresh frames.
+
+        Clicking a list row only requests a selection; the SDK can still expose
+        the old text or an open dropdown for several frames afterwards.
+        """
+        started=time.monotonic()
+        deadline=started+timeout
+        stable=0
+        previous=None
+        last_raw=''
+        last_phase='sdk_transition'
+        while time.monotonic()<deadline:
+            self.screenshot()
+            sdk=bool(self.appear(self.I_SA_NETEASE_GAME_LOGO))
+            closed=bool(self.appear(self.I_SA_ACCOUNT_DROP_DOWN_CLOSED))
+            login=bool(self.appear(self.I_SA_ACCOUNT_LOGIN_BTN))
+            last_raw=self.O_SA_ACCOUNT_ACCOUNT_SELECTED.ocr_single(self.device.image) if sdk and closed and login else ''
+            matched=sdk and closed and login and exact_account_matches(accountInfo,last_raw)
+            stable=stable+1 if matched else 0
+            last_phase=('identity_verified' if stable>=confirm_frames else 'identity_candidate' if matched
+                        else 'selected_identity_mismatch' if sdk and closed and login
+                        else 'dropdown_open' if sdk and not closed else 'sdk_transition')
+            observation=(last_phase,str(last_raw),sdk,closed,login)
+            if observation!=previous:
+                logger.info('SDK account verification phase=%s raw=%r sdk=%s closed=%s login=%s stable=%s',
+                            last_phase,last_raw,sdk,closed,login,stable)
+                previous=observation
+            if stable>=confirm_frames:
+                return True
+            time.sleep(.2)
+        self.login_failure_reason='selected_account_verification_timeout'
+        logger.warning('SDK account verification timed out: phase=%s raw=%r target=%r elapsed=%.2fs',
+                       last_phase,last_raw,accountInfo.account,time.monotonic()-started)
+        return False
+
+    def _bounded_wait(self,predicate,*,click=None,guard=None,timeout=30,interval=2):
+        """Observe native rules without depending on BaseTask.ui_click versions."""
+        deadline,next_click=time.monotonic()+timeout,0
+        while time.monotonic()<deadline:
+            self.screenshot()
+            if predicate():return True
+            now=time.monotonic()
+            if click is not None and now>=next_click and self.appear(click) and (guard is None or guard()):
+                self.click(click)
+                next_click=now+interval
+            time.sleep(.15)
+        return False
 
     def get_svr_name(self):
         self.screenshot()
@@ -150,7 +210,9 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
         @return:
         @rtype:
         """
-        while 1:
+        deadline=time.monotonic()+45
+        while time.monotonic()<deadline:
+            self.screenshot()
             if self.appear(self.I_SA_NETEASE_GAME_LOGO) and self.appear(self.I_SA_ACCOUNT_LOGIN_BTN):
                 return
             if self.appear_then_click(self.I_SA_SWITCH_ACCOUNT_BTN, interval=1.5):
@@ -158,7 +220,8 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
             if self.appear(self.I_CHECK_LOGIN_FORM):
                 self.click(self.C_SA_LOGIN_FORM_USER_CENTER, 1.5)
                 continue
-        return
+            time.sleep(.15)
+        return False
 
     def selectAccount(self, accountInfo: AccountInfo):
         logger.info("start selectAccount")
@@ -178,7 +241,7 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
                 self.screenshot()
                 if self.appear(self.I_SA_ACCOUNT_DROP_DOWN_CLOSED):
                     selected = self.O_SA_ACCOUNT_ACCOUNT_SELECTED.ocr_single(self.device.image)
-                    if accountInfo.is_account_alias(selected):
+                    if exact_account_matches(accountInfo,selected):
                         return True
                     self.ui_click_until_disappear(self.I_SA_ACCOUNT_DROP_DOWN_CLOSED,
                                                   interval=1.5)
@@ -190,7 +253,7 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
 
                 # 找到该账号
                 for index, ocr_account in enumerate(account_names):
-                    if not accountInfo.is_account_alias(ocr_account):
+                    if not exact_account_matches(accountInfo,ocr_account):
                         continue
                     # if accountInfo.account in [ocrResItem.ocr_text for ocrResItem in ocrRes]:
                     #     index = [ocrResItem.ocr_text for ocrResItem in ocrRes].index(accountInfo.account)
@@ -253,16 +316,19 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
         """
         self.screenshot()
         #
-        if not (self.appear(self.I_CHECK_LOGIN_FORM) or self.appear(self.I_SA_NETEASE_GAME_LOGO)):
+        if not (self.appear(self.I_CHECK_LOGIN_FORM) or self.appear(self.I_SA_NETEASE_GAME_LOGO)
+                or self.appear(self.I_SA_SWITCH_ACCOUNT_BTN)):
             logger.error("Unknown Page,%s %s Login Failed", accountInfo.character, accountInfo.svr)
             return False
 
         #
         isAccountLogon = False
         isCharacterSelected = False
+        verified=False
         self.O_SA_ACCOUNT_ACCOUNT_SELECTED.keyword = accountInfo.account
         self.O_SA_LOGIN_FORM_USER_CENTER_ACCOUNT.keyword = accountInfo.account
-        while 1:
+        deadline=time.monotonic()+150
+        while time.monotonic()<deadline:
             self.screenshot()
             # 处于 选择服务器界面 直接点击空白区域退出该界面 进入切换账号流程
             if self.appear(self.I_SA_CHECK_SELECT_SVR_1) or self.appear(self.I_SA_CHECK_SELECT_SVR_2):
@@ -271,6 +337,7 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
 
             # 处于选择 苹果安卓界面
             if self.appear(self.I_SA_LOGIN_FORM_APPLE):
+                if not verified:return False
                 btn = self.I_SA_LOGIN_FORM_ANDROID if accountInfo.apple_or_android else self.I_SA_LOGIN_FORM_APPLE
                 self.ui_click_until_disappear(btn)
                 isAccountLogon = True
@@ -282,37 +349,50 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
                     return False
                 # 当前选择账号不是account
                 selected = self.O_SA_ACCOUNT_ACCOUNT_SELECTED.ocr_single(self.device.image)
-                if not accountInfo.is_account_alias(selected):
+                # With the dropdown open this ROI contains its first row,
+                # which is not evidence that that account has been selected.
+                if not self.appear(self.I_SA_ACCOUNT_DROP_DOWN_CLOSED) or not exact_account_matches(accountInfo,selected):
                     # 没有找到account
                     if not self.selectAccount(accountInfo):
                         self.ui_click_until_disappear(self.C_SA_LOGIN_FORM_ACCOUNT_CLOSE_BTN,
                                                       stop=self.I_SA_NETEASE_GAME_LOGO)
                         return False
-                    # selectAccount 后更新图片
-                    self.screenshot()
-                self.ui_click(self.I_SA_ACCOUNT_LOGIN_BTN, stop=self.I_SA_LOGIN_FORM_APPLE, interval=1)
+                if not self._wait_selected_account(accountInfo):return False
+                verified=True
+                if not self._bounded_wait(
+                        lambda:self.appear(self.I_SA_LOGIN_FORM_APPLE) or self.appear(self.I_SA_SWITCH_ACCOUNT_BTN)
+                        or (self.appear(self.I_CHECK_LOGIN_FORM) and not self.appear(self.I_SA_NETEASE_GAME_LOGO)),
+                        click=self.I_SA_ACCOUNT_LOGIN_BTN,timeout=35,
+                        guard=lambda:exact_account_matches(accountInfo,self.O_SA_ACCOUNT_ACCOUNT_SELECTED.ocr_single(self.device.image))):
+                    return False
                 continue
             # 在用户中心界面
             if self.appear(self.I_SA_SWITCH_ACCOUNT_BTN):
                 # 如果当前已登录用户就是account
                 ocrRes = self.O_SA_LOGIN_FORM_USER_CENTER_ACCOUNT.ocr_single(self.device.image)
                 # NOTE 由于邮箱账号@符号极易被误识别为其他,故对账号信息做预处理 便于比对
-                if (accountInfo.account is None) or accountInfo.account == "" or accountInfo.is_account_alias(ocrRes):
+                if exact_account_matches(accountInfo,ocrRes):
                     logger.info("current is the account we want:ocr result %s", ocrRes)
                     isAccountLogon = True
+                    verified=True
                     self.ui_click_until_disappear(self.C_SA_LOGIN_FORM_USER_CENTER_CLOSE_BTN, interval=1,
                                                   stop=self.I_SA_SWITCH_ACCOUNT_BTN)
                     continue
                 #
-                if self.ui_click(self.I_SA_SWITCH_ACCOUNT_BTN, self.I_SA_NETEASE_GAME_LOGO):
+                if self._bounded_wait(lambda:self.appear(self.I_SA_NETEASE_GAME_LOGO)
+                                      or (self.appear(self.I_CHECK_LOGIN_FORM) and not self.appear(self.I_SA_SWITCH_ACCOUNT_BTN)),
+                                      click=self.I_SA_SWITCH_ACCOUNT_BTN,timeout=30):
                     isAccountLogon = False
+                    verified=False
                     continue
-                continue
+                return False
             # 在游戏登录界面 不在用户中心 不在切换账号界面
             if not (self.appear(self.I_SA_NETEASE_GAME_LOGO) or self.appear(self.I_SA_SWITCH_ACCOUNT_BTN)):
                 # 判断是否已经账号登录
                 if not isAccountLogon:
-                    self.click(self.C_SA_LOGIN_FORM_USER_CENTER)
+                    if self.appear(self.I_CHECK_LOGIN_FORM):
+                        self.click(self.C_SA_LOGIN_FORM_USER_CENTER,interval=2)
+                    time.sleep(.15)
                     continue
 
                 # 同区切号只配置账号即可，沿用账号记忆的区服，不进入角色/区服选择。
@@ -344,7 +424,7 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
                      'Android' if accountInfo.apple_or_android else 'Apple')
         return False
 
-    def ui_click_until_disappear(self, click, interval: float = 1, stop: RuleImage | RuleGif = None):
+    def ui_click_until_disappear(self, click, interval: float = 1, stop: RuleImage | RuleGif = None, timeout=30):
         """
         重写原ui_click_until_disappear方法,增加stop参数
         点击一个按钮直到stop消失
@@ -357,10 +437,11 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
         """
         if (isinstance(click, RuleImage) or isinstance(click, RuleGif)) and (stop is None):
             stop = click
-        while 1:
+        deadline=time.monotonic()+timeout
+        while time.monotonic()<deadline:
             self.screenshot()
             if not self.appear(stop):
-                break
+                return True
             if isinstance(click, RuleImage) or isinstance(click, RuleGif):
                 self.appear_then_click(click, interval=interval)
                 continue
@@ -370,3 +451,4 @@ class LoginAccount(BaseTask, SwitchAccountAssets):
             elif isinstance(click, RuleOcr):
                 self.click(click)
                 continue
+        return False

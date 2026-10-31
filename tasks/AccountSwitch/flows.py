@@ -1,7 +1,7 @@
 """Isolated per-account daily and counted awakening subflows."""
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 import re
 from time import monotonic, sleep
@@ -17,13 +17,27 @@ from module.logger import logger
 from tasks.AccountSwitch.config import DoneRecord
 from tasks.DailyTrifles.config import DailyTrifles, DailyTriflesConfig, SummonType
 from tasks.DailyTrifles.script_task import ScriptTask as DailyTask
-from tasks.EvoZone.config import Layer, UserStatus
+from tasks.EvoZone.config import Layer, UserStatus, KirinType
 from tasks.EvoZone.script_task import ScriptTask as EvoTask
-from tasks.Component.GeneralBattle.battle_wait import battle_wait_options
+try:
+    from tasks.Component.GeneralBattle.battle_wait import battle_wait_options
+except ModuleNotFoundError as exc:
+    if exc.name != 'tasks.Component.GeneralBattle.battle_wait':
+        raise
+    # The newer Page FSM owns battle behavior per call and removed this module.
+    battle_wait_options = None
 from tasks.GameUi.page import page_awake_zones, page_main, page_summon
-from tasks.DailyTrifles.page import page_store_gift_room
+try:
+    from tasks.DailyTrifles.page import page_store_gift_room
+except ModuleNotFoundError as exc:
+    if exc.name != 'tasks.DailyTrifles.page':
+        raise
+    from tasks.GameUi.task_pages import page_store_gift_room
 from tasks.Restart.assets import RestartAssets
 from tasks.Restart.login import LoginHandler
+from tasks.AccountSwitch.assets import AccountFlowAssets
+from tasks.AccountSwitch.dialogs import AccountDialogGuard
+from tasks.AccountSwitch.assist import AssistSelection, AssistError, prepare_battle_assist, leave_preparation
 
 
 def wait_for(task, predicate, seconds: float, action=None) -> bool:
@@ -66,6 +80,7 @@ class DailyResult:
     done_record: DoneRecord
     success: bool
     pending: tuple[str, ...] = ()
+    confirmed: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -74,6 +89,10 @@ class AwakeningResult:
     completed: int
     success: bool
     reason: str = ''
+    assist_verified: bool = False
+    normal_used: int | None = None
+    card_used: int | None = None
+    daily_target_reached: bool = False
 
 
 class _ModelView:
@@ -123,19 +142,26 @@ class IsolatedConfig:
 class _RoutineDailyOptions(DailyTriflesConfig):
     courtyard_affairs: bool = True
     pickup_email: bool = True
+    # Removed from newer native DailyTrifles; retain explicit per-account
+    # choices and report unsupported selected steps as pending.
+    friend_love: bool = False
+    guild_wish: bool = False
 
 
 class _RoutineDailyConfig(DailyTrifles):
     trifles_config: _RoutineDailyOptions = Field(default_factory=_RoutineDailyOptions)
     done_record: DoneRecord = Field(default_factory=DoneRecord)
     _routine_day: date | None = PrivateAttr(default=None)
+    _routine_confirmed: dict = PrivateAttr(default_factory=dict)
 
     def today_is_done(self, mode: str) -> bool:
+        if self._routine_confirmed.get(mode) is True:
+            return True
         completed_at = getattr(self.done_record, f'{mode}_dt', None)
         if self._routine_day is None:
             within_routine = completed_at is not None and completed_at.date() == datetime.now().date()
         else:
-            start = datetime.combine(self._routine_day, time(hour=18))
+            start = datetime.combine(self._routine_day, time(hour=6))
             within_routine = completed_at is not None and start <= completed_at < start + timedelta(days=1)
         if mode == 'guild_donate':
             if not within_routine:
@@ -144,9 +170,10 @@ class _RoutineDailyConfig(DailyTrifles):
         return within_routine
 
 
-class AccountDailyTask(DailyTask, RestartAssets):
-    harvest_courtyard_affairs = LoginHandler.harvest_courtyard_affairs
-    harvest_mail = LoginHandler.harvest_mail
+class AccountDailyTask(AccountDialogGuard, DailyTask, RestartAssets):
+    DEFAULT_UNKNOWN_CLOSERS=[DailyTask.I_UI_BACK_RED,DailyTask.I_UI_BACK_BLUE,DailyTask.I_UI_BACK_YELLOW]
+    harvest_courtyard_affairs = getattr(LoginHandler, 'harvest_courtyard_affairs', None)
+    harvest_mail = getattr(LoginHandler, 'harvest_mail', None)
 
     def run(self):
         settings = self.config.daily_trifles.trifles_config
@@ -175,6 +202,10 @@ class AccountDailyTask(DailyTask, RestartAssets):
     def run_courtyard_affairs(self):
         daily = self.config.daily_trifles
         if not daily.today_is_done('courtyard_affairs'):
+            if self.harvest_courtyard_affairs is None:
+                super().run_courtyard_affairs()
+                self.config.save()
+                return
             self.goto_page(page_main)
             if self.harvest_courtyard_affairs():
                 daily.done_record.courtyard_affairs_dt = datetime.now()
@@ -184,6 +215,10 @@ class AccountDailyTask(DailyTask, RestartAssets):
     def run_pickup_email(self):
         daily = self.config.daily_trifles
         if not daily.today_is_done('pickup_email'):
+            if self.harvest_mail is None:
+                super().run_pickup_email()
+                self.config.save()
+                return
             self.goto_page(page_main)
             self.screenshot()
             # False explicitly means that no mail entry/read-all button is
@@ -203,7 +238,11 @@ class AccountDailyTask(DailyTask, RestartAssets):
     def run_friend_love(self):
         daily = self.config.daily_trifles
         if not daily.today_is_done('friend_love'):
-            super().run_friend_love()
+            native_action=getattr(super(),'run_friend_love',None)
+            if native_action is None:
+                logger.warning('当前原壳未提供好友爱心任务，保留未完成状态')
+                return
+            native_action()
             daily.done_record.friend_love_dt = datetime.now()
         self.config.save()
 
@@ -322,7 +361,7 @@ def _daily_pending(daily: DailyTrifles) -> tuple[str, ...]:
 
 def run_daily(config, device, done_record: DoneRecord | dict,
               on_progress: Callable[[DoneRecord], None] | None = None,
-              routine_day: date | str | None = None) -> DailyResult:
+              routine_day: date | str | None = None, *, confirmed: dict | None = None) -> DailyResult:
     """Run the parent's selected daily options against one account's record.
 
     on_progress is the only persistence hook. It receives a detached DoneRecord
@@ -334,10 +373,16 @@ def run_daily(config, device, done_record: DoneRecord | dict,
     if account_settings is not None:
         daily.trifles_config.courtyard_affairs = account_settings.daily_courtyard_affairs
         daily.trifles_config.pickup_email = account_settings.daily_pickup_email
+        read_options=getattr(account_settings,'get_daily_free_options',None)
+        if callable(read_options):
+            for name,enabled in read_options().items():
+                if name in ('friend_love','luck_msg','store_sign') and type(enabled) is bool:
+                    setattr(daily.trifles_config,name,enabled)
     daily.done_record = DoneRecord.model_validate(
         done_record.model_dump() if isinstance(done_record, DoneRecord) else done_record
     )
     daily._routine_day = date.fromisoformat(routine_day) if isinstance(routine_day, str) else routine_day
+    daily._routine_confirmed={key:True for key,value in (confirmed or {}).items() if value is True}
 
     def checkpoint():
         if on_progress is not None:
@@ -351,10 +396,26 @@ def run_daily(config, device, done_record: DoneRecord | dict,
     finally:
         checkpoint()
     pending = _daily_pending(daily)
-    return DailyResult(daily.done_record.model_copy(deep=True), not pending, pending)
+    names=('summon','courtyard_affairs','pickup_email','guild_wish','friend_love','luck_msg','store_sign','sushi')
+    result_confirmed={**daily._routine_confirmed,**{name:True for name in names if daily.today_is_done(name)}}
+    return DailyResult(daily.done_record.model_copy(deep=True), not pending, pending, result_confirmed)
 
 
-class AccountAwakeningTask(EvoTask):
+class AccountAwakeningTask(AccountDialogGuard, EvoTask, AccountFlowAssets):
+    DEFAULT_UNKNOWN_CLOSERS=[EvoTask.I_UI_BACK_RED,EvoTask.I_UI_BACK_BLUE,EvoTask.I_UI_BACK_YELLOW]
+
+    def evozone_enter(self):
+        kind=self.config.evo_zone.evo_zone_config.kirin_type
+        rule={KirinType.FIREKIRIN:self.I_FIRE_KIRIN,KirinType.WINDKIRIN:self.I_WIND_KIRIN,
+              KirinType.WATERKIRIN:self.I_WATER_KIRIN}.get(kind,self.I_LIGHTNING_KIRIN)
+        return wait_for(self,lambda:self.appear(self.I_FORM_TEAM) or self.appear(self.I_EVOZONE_FIRE),25,
+                        action=lambda:self.appear_then_click(rule,interval=1))
+
+    def check_lock(self,lock=True):
+        target,button=(self.I_EVOZONE_LOCK,self.I_EVOZONE_UNLOCK) if lock else (self.I_EVOZONE_UNLOCK,self.I_EVOZONE_LOCK)
+        return wait_for(self,lambda:self.appear(target),12,
+                        action=lambda:self.appear_then_click(button,interval=1))
+
     def _select_account_layer(self, layer: Layer) -> bool:
         # Accept either "壹" or "壹层" from the SDK's narrow layer column.
         # Unlike RuleList's empty-OCR (0, 0) fallback, no OCR match means failure.
@@ -395,39 +456,86 @@ class AccountAwakeningTask(EvoTask):
             sleep(0.8)
         return False
 
-    def run_counted(self, count: int, on_progress: Callable[[int], None] | None) -> AwakeningResult:
+    def run_counted(self, count: int, on_progress: Callable[[int], None] | None,
+                    assist: AssistSelection | None = None) -> AwakeningResult:
+        requested=count
         self.goto_page(page_awake_zones)
-        if not self.evozone_enter():
-            return AwakeningResult(count, 0, False, 'entry_failed')
-        settings = self.config.evo_zone
+        if not self.evozone_enter(): return AwakeningResult(requested,0,False,'entry_failed')
+        settings=self.config.evo_zone
         if not self._select_account_layer(settings.evo_zone_config.layer):
-            return AwakeningResult(count, 0, False, 'layer_not_found')
-        self.check_lock(True)
-        completed = 0
-        while completed < count:
-            if not wait_for(self, lambda: self.appear(self.I_EVOZONE_FIRE), 20):
-                return AwakeningResult(count, completed, False, 'challenge_page_missing')
-            if not click_until_gone(self, self.I_EVOZONE_FIRE, interval=1, timeout=20,
-                                    confirm_frames=2, max_clicks=10):
-                return AwakeningResult(count, completed, False, 'challenge_not_started')
-            with battle_wait_options(
-                completion={'check_imgs': [self.I_EVOZONE_FIRE]},
-                preset={'preset_enable': False}, green={'green_enable': False},
-                prepare={'lock_team': True},
-            ):
-                won = self.run_general_battle(config=settings.general_battle_config)
-            if not won:
-                return AwakeningResult(count, completed, False, 'battle_lost')
-            # GeneralBattle.current_count counts starts, including losses. Only
-            # a settled win contributes to the account's persistent daily count.
-            completed += 1
-            if on_progress is not None:
-                on_progress(completed)
-        return AwakeningResult(count, completed, True)
+            return AwakeningResult(requested,0,False,'layer_not_found')
+        proof=None;started=False
+        def result(completed,success,reason=''):
+            return AwakeningResult(requested,completed,success,reason,proof is not None,
+                                   proof.normal_used if proof else None,proof.card_used if proof else None,
+                                   bool(proof and proof.card_used+completed>=14))
+        if assist is not None:
+            if not self.check_lock(False): return result(0,False,'assist_unlock_unconfirmed')
+            if not click_until_gone(self,self.I_EVOZONE_FIRE,interval=1,timeout=20,confirm_frames=2,max_clicks=2):
+                return result(0,False,'challenge_not_started')
+            try: proof=prepare_battle_assist(self,assist)
+            except AssistError as exc:
+                leave_preparation(self)
+                return result(0,False,str(exc))
+            if proof.card_used>=14:
+                left=leave_preparation(self)
+                return result(0,left,'assist_daily_target_already_reached' if left else 'assist_exit_unconfirmed')
+            if count==0 or not proof.deployed:
+                leave_preparation(self)
+                return result(0,False,'assist_remaining_zero_or_undeployed')
+            count=min(count,14-proof.card_used)
+            if not click_until_gone(self,self.I_PREPARE_HIGHLIGHT,interval=1,timeout=12,confirm_frames=2,max_clicks=2):
+                leave_preparation(self)
+                return result(0,False,'assist_prepare_unconfirmed')
+            started=True
+        else: self.check_lock(True)
+        completed=0
+        while completed<count:
+            if not started:
+                if not wait_for(self,lambda:self.appear(self.I_EVOZONE_FIRE),20):
+                    return result(completed,False,'challenge_page_missing')
+                if not click_until_gone(self,self.I_EVOZONE_FIRE,interval=1,timeout=20,confirm_frames=2,max_clicks=10):
+                    return result(completed,False,'challenge_not_started')
+                if assist is not None and self.appear(self.I_PREPARE_HIGHLIGHT):
+                    leave_preparation(self)
+                    return result(completed,False,'assist_unverified_preparation_reappeared')
+            started=False
+            won=self._run_account_battle(settings.general_battle_config)
+            if not won:return result(completed,False,'battle_lost')
+            # A native win may precede the final transition out of settlement.
+            # Do not checkpoint or start another battle until challenge is back.
+            if not wait_for(self,lambda:self.appear(self.I_EVOZONE_FIRE),20):
+                return result(completed,False,'battle_return_unconfirmed')
+            completed+=1
+            if on_progress is not None:on_progress(completed)
+            if assist is not None and completed==1 and completed<count and not self.check_lock(True):
+                return result(completed,False,'assist_relock_unconfirmed')
+        return result(completed,True,'assist_daily_target_reached' if proof and proof.card_used+completed>=14 else '')
+
+    def _run_account_battle(self, config) -> bool:
+        """Use the installed native battle lifecycle without copying its engine."""
+        if battle_wait_options is not None:
+            with battle_wait_options(completion={'check_imgs':[self.I_EVOZONE_FIRE]},
+                                     preset={'preset_enable':False},green={'green_enable':False},
+                                     prepare={'lock_team':True}):
+                return self.run_general_battle(config=config)
+        native_config=config.model_copy(deep=True)
+        native_config.preset_enable=False
+        native_config.green_enable=False
+        native_config.lock_team_enable=True
+        native_config.continuous_battle=False
+        native_config.max_continuous=0
+        native_config.quick_exit=False
+        if native_config.battle_timeout <= 0:
+            native_config.battle_timeout=420
+        return self.run_general_battle(config=native_config,
+                                       battle_key='account_switch_awakening',
+                                       exit_matcher=self.I_EVOZONE_FIRE)
 
 
 def run_awakening(config, device, layer: int = 1, count: int = 14,
-                  on_progress: Callable[[int], None] | None = None) -> AwakeningResult:
+                  on_progress: Callable[[int], None] | None = None, *,
+                  assist: AssistSelection | None = None, kirin: str | None = None) -> AwakeningResult:
     """Run exactly count remaining solo wins, reporting this call's win count.
 
     The parent adds completed to its saved count and passes only the remainder
@@ -437,11 +545,17 @@ def run_awakening(config, device, layer: int = 1, count: int = 14,
         raise ValueError('觉醒层数必须为 1 至 10')
     if isinstance(count, bool) or not isinstance(count, int) or count < 0:
         raise ValueError('觉醒剩余次数必须为非负整数')
-    if count == 0:
+    if assist is not None and not isinstance(assist,AssistSelection):
+        raise ValueError('协战参数须为已核验的AssistSelection')
+    if count == 0 and assist is None:
         return AwakeningResult(0, 0, True)
     evo = config.evo_zone.model_copy(deep=True)
     evo.evo_zone_config.user_status = UserStatus.ALONE
     evo.evo_zone_config.layer = list(Layer)[layer - 1]
+    if kirin is not None:
+        values={'lightning':KirinType.LIGHTNINGKIRIN,'fire':KirinType.FIREKIRIN,'wind':KirinType.WINDKIRIN,'water':KirinType.WATERKIRIN}
+        if kirin not in values:raise ValueError('觉醒麒麟不正确')
+        evo.evo_zone_config.kirin_type=values[kirin]
     evo.evo_zone_config.limit_count = count
     evo.evo_zone_config.soul_buff_enable = False
     for field in ('friend_list', 'cooperation_script', 'friend_1', 'friend_2'):
@@ -459,4 +573,5 @@ def run_awakening(config, device, layer: int = 1, count: int = 14,
         if hasattr(battle, field):
             setattr(battle, field, value)
     isolated = IsolatedConfig(config, {'evo_zone': evo})
-    return AccountAwakeningTask(isolated, device).run_counted(count, on_progress)
+    task=AccountAwakeningTask(isolated,device)
+    return task.run_counted(count,on_progress,assist=assist) if assist is not None else task.run_counted(count,on_progress)
