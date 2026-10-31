@@ -1,6 +1,7 @@
 """A single, resumable jade cooperation owned by one alt account."""
 
 from dataclasses import dataclass
+from inspect import signature
 from time import monotonic
 from typing import Callable
 from unicodedata import normalize
@@ -122,22 +123,33 @@ class JadeCooperationTask(WantedQuestsTask):
         return [left, top, right - left, bottom - top]
 
     def find_wq(self, image, *, allow_edge_fallback: bool = False):
-        # dev's finder accepts only the image. Keep the feature's caller shape
-        # local rather than changing the shared WantedQuests parser/API.
-        return super().find_wq(image)
+        native=super().find_wq
+        if 'allow_edge_fallback' in signature(native).parameters:
+            return native(image,allow_edge_fallback=allow_edge_fallback)
+        return native(image)
 
     def open_wq_info(self) -> bool:
+        native=getattr(super(),'open_wq_info',None)
+        if callable(native):return native()
         return self._click_until(self.O_WQ_TEXT_ALL, self.I_TRACE_TRUE, seconds=5)
 
     def execute_mission(self, num_want: int):
-        # dev opens the selected tracker inside this method and requires the
-        # OCR click target and challenge-ticket count as separate arguments.
+        native=super().execute_mission
+        try:
+            signature(native).bind(num_want)
+        except TypeError:
+            pass
+        else:
+            # The current shell owns strategy selection and challenge OCR.
+            return native(num_want)
+        # Older dev opens the tracker itself and takes its OCR click target
+        # and challenge-ticket count separately. Adapt only this legacy shape.
         number = self.O_WQ_NUMBER.ocr(self.device.image)
         try:
             number = int(number)
         except (TypeError, ValueError):
             number = 0
-        return super().execute_mission(self.O_WQ_TEXT_ALL, num_want, number)
+        return native(self.O_WQ_TEXT_ALL, num_want, number)
 
     def _click_until(self, click, stop, seconds: float = 8) -> bool:
         deadline = monotonic() + seconds

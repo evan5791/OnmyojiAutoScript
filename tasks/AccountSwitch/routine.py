@@ -57,13 +57,13 @@ def next_routine_run(now: datetime, settings, period: RoutinePeriod, retry: bool
 
 
 def window(now: datetime, platform: str = 'android') -> tuple[str, datetime, datetime]:
-    """The Android refresh is 06/18; iOS daily work spans one 06-to-06 day."""
+    """Android jade refreshes at 06/18; iOS daily work resets at midnight."""
     if platform == 'android':
         period = refresh_period(now)
         return ('evening' if period.evening else 'daytime'), period.start, period.end
     if platform != 'ios':
         raise ValueError('平台须为 android 或 ios')
-    start = datetime.combine((now - timedelta(hours=6)).date(), time(6))
+    start = datetime.combine(now.date(), time())
     return 'ios_daily', start, start + timedelta(days=1)
 
 
@@ -72,7 +72,7 @@ def _bounds(plan, day):
         raise ValueError('未知小号日程')
     if isinstance(day, str):
         day = date.fromisoformat(day)
-    start = datetime.combine(day, time(18 if plan == 'evening' else 6))
+    start = datetime.combine(day, time(0 if plan == 'ios_daily' else 18 if plan == 'evening' else 6))
     return start, start + timedelta(hours=24 if plan == 'ios_daily' else 12)
 
 
@@ -115,8 +115,7 @@ def sample(runtime, settings, plan: str, day) -> dict:
         if (not isinstance(value, dict) or value.get('signature') != signature
                 or _parse(value.get('at')) is None):
             start, end = _bounds(plan, day)
-            nominal_day = day + timedelta(days=1) if plan == 'ios_daily' and selected < time(6) else day
-            nominal = datetime.combine(nominal_day, selected)
+            nominal = datetime.combine(day, selected)
             offset = random.randint(-radius * 60, radius * 60) if radius else 0
             at = min(max(nominal + timedelta(seconds=offset), start), end - timedelta(seconds=1))
             value = {'signature': signature, 'at': at.isoformat(), 'state': 'pending'}

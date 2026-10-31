@@ -124,8 +124,9 @@ class ScriptTask(GameUi):
 
     def audit(self, account, platform, stage, details=None, day=None):
         from tasks.AccountSwitch.history import record_event
+        occurred_at = datetime.now()
         return record_event(self.config, account, platform, stage, details,
-                            day=day, occurred_at=datetime.now())
+                            day=occurred_at.date().isoformat(), occurred_at=occurred_at)
 
     def daily_options(self, settings):
         source = getattr(getattr(self.config, 'daily_trifles', None), 'trifles_config', None)
@@ -205,7 +206,7 @@ class ScriptTask(GameUi):
         from tasks.AccountSwitch.jade import JadeCooperationTask as RoutineJadeTask
         runtime = self.config.account_switch.runtime
         plan, started, until = window(period_start or datetime.now(), platform)
-        day = started.date().isoformat()
+        day = datetime.now().date().isoformat()
         evening = plan == 'evening'
         options = self.daily_options(settings)
         completed, failed, skipped = [], [], []
@@ -223,8 +224,9 @@ class ScriptTask(GameUi):
                 failed.append(slot.owner_account)
                 logger.warning('待完成勾协原小号已移除或更改接收方，保留%s的派发状态', receiver)
         for index, row in enumerate(rows, 1):
-            if window(datetime.now(), platform)[1] != started:
-                logger.warning('执行期间跨刷新边界，停止本批并保留进度')
+            now = datetime.now()
+            if now.date().isoformat() != day or window(now, platform)[1] != started:
+                logger.warning('执行期间跨午夜或勾协刷新边界，停止本批并保留进度')
                 failed.append('refresh_boundary')
                 break
             mode = row.android_mode if platform == 'android' else row.ios_mode
@@ -240,17 +242,21 @@ class ScriptTask(GameUi):
             receiver = row.jade_receiver or settings.jade_receiver or default_receiver
             friend = row.assist_friend or settings.assist_friend
             slot = slots.get(receiver)
-            login_due = mode == 'login' and (progress.login_day != day if platform == 'ios'
-                                            else progress.login_period != started.isoformat())
+            login_due = mode == 'login' and progress.login_day != day
             jade_due = (platform == 'android' and mode == 'plan' and not slot.completed
                         and (slot.owner_account == key or key not in slot.checked_accounts)
                         and (not slot.owner_account or slot.owner_account == key))
             daily_due = mode != 'login' and (platform == 'ios' or evening) and (
                 not progress.daily_done or bool(progress.daily_options) and any(
                     enabled and progress.daily_options.get(name) is not True for name, enabled in options.items()))
+            awake_target = min(settings.awakening_count, 14)
+            # Imported wins without native borrowing evidence retain their old
+            # completed/skip behavior. A native attempt must instead resume
+            # from its verified cooperation counter, even if an old max-based
+            # checkpoint had already inflated awakening_completed.
             awake_due = (platform == 'android' and mode == 'plan' and evening
-                         and not progress.awakening_daily_done
-                         and progress.awakening_completed < settings.awakening_count)
+                         and not (progress.awakening_daily_done and progress.awakening_completed >= awake_target)
+                         and (progress.awakening_completed < awake_target or bool(progress.awakening_assist_friend)))
             if not (login_due or jade_due or daily_due or awake_due):
                 skipped.append(row.account)
                 self.audit(row.account, platform, 'skipped', {'reason': 'confirmed_already_done'}, day)
@@ -272,12 +278,17 @@ class ScriptTask(GameUi):
                 if not SwitchAccount(self.config, self.device, info).switchAccount():
                     raise RequestHumanTakeover('账号登录未完成')
                 self.audit(row.account, platform, 'login', {'character': info.character}, day)
+                now = datetime.now()
+                if now.date().isoformat() != day or window(now, platform)[1] != started:
+                    raise RequestHumanTakeover('登录期间跨午夜或勾协刷新边界，停止本号后续步骤')
                 if mode == 'login':
                     progress.login_day, progress.login_period = day, started.isoformat()
                 else:
                     if daily_due:
                         step = 'daily'
                         def save_daily(record):
+                            if datetime.now().date().isoformat() != day:
+                                raise RequestHumanTakeover('日常保存时跨午夜，不将新日期写入昨日进度')
                             previous = progress.daily_record.model_dump()
                             current = record.model_dump()
                             for name, value in current.items():
@@ -301,8 +312,9 @@ class ScriptTask(GameUi):
                             self.audit(row.account, platform, 'task_error', {'step': step, 'reason': str(result.pending)}, day)
                         self.config.save()
                         self.goto_page(page_main)
-                    if window(datetime.now(), platform)[1] != started:
-                        raise RequestHumanTakeover('日常执行期间跨过刷新边界，停止本号后续步骤')
+                    now = datetime.now()
+                    if now.date().isoformat() != day or window(now, platform)[1] != started:
+                        raise RequestHumanTakeover('日常执行期间跨午夜或勾协刷新边界，停止本号后续步骤')
                     if jade_due:
                         step = 'jade'
                         def save_jade(value):
@@ -325,19 +337,45 @@ class ScriptTask(GameUi):
                             self.audit(row.account, platform, 'task_error', {'step': step, 'reason': result.reason}, day)
                         self.config.save()
                         self.goto_page(page_main)
-                    if window(datetime.now(), platform)[1] != started:
-                        raise RequestHumanTakeover('勾协执行期间跨过刷新边界，停止后续觉醒')
+                    now = datetime.now()
+                    if now.date().isoformat() != day or window(now, platform)[1] != started:
+                        raise RequestHumanTakeover('勾协执行期间跨午夜或勾协刷新边界，停止后续觉醒')
                     if awake_due:
                         step = 'cooperation_counter'
                         selection = prepare_cooperation_assist(self.config, self.device, friend)
                         observed = selection.normal_used
                         if type(observed) is not int or not 0 <= observed <= 15:
                             raise RequestHumanTakeover('普通副本次数无效，不按0处理')
-                        base = max(progress.awakening_completed, observed)
+                        base = observed
                         verified = selection.card_used is not None and selection.card_used == observed
+                        # Remember that native verification has begun before
+                        # entering battle. A stop before the first win must not
+                        # revive an imported completed-count shortcut.
+                        progress.awakening_assist_friend = selection.friend
+                        progress.awakening_daily_done = False
+                        self.config.save()
+                        saved_session_wins = 0
                         def save_wins(count):
-                            total = max(progress.awakening_completed, base + count)
-                            delta = max(0, total - max(base, progress.awakening_completed))
+                            nonlocal saved_session_wins
+                            if type(count) is not int or count < 0:
+                                raise ValueError('觉醒已确认胜场回调无效')
+                            # The flow calls back only after native borrowing
+                            # proof, a win, and the return from settlement. Its
+                            # count is cumulative for this invocation, not a
+                            # replacement for historical script wins.
+                            count = max(saved_session_wins, count)
+                            delta = count - saved_session_wins
+                            today = datetime.now().date().isoformat()
+                            if today != day:
+                                if delta:
+                                    self.audit(row.account, platform, 'awakening_progress',
+                                        {'delta_wins': delta, 'session_wins': count,
+                                         'assist_friend': selection.friend, 'source': 'native_assist_verified',
+                                         'reason': 'midnight_boundary_counter_requires_recheck'}, today)
+                                saved_session_wins = count
+                                raise RequestHumanTakeover('觉醒结算时跨午夜，保留真实胜场审计并等待新日UI计数复核')
+                            saved_session_wins = count
+                            total = base + count
                             progress.awakening_completed = total
                             progress.awakening_observed = observed
                             progress.awakening_assist_friend = selection.friend
@@ -345,27 +383,36 @@ class ScriptTask(GameUi):
                             self.config.save()
                             if delta:
                                 self.audit(row.account, platform, 'awakening_progress', {'confirmed': total,
-                                    'observed': observed, 'delta_wins': delta, 'assist_friend': selection.friend}, day)
-                        if observed >= 14 and verified:
+                                    'observed': observed, 'delta_wins': delta, 'session_wins': count,
+                                    'assist_friend': selection.friend, 'source': 'native_assist_verified'}, day)
+                        if observed >= awake_target and verified:
                             progress.awakening_daily_done = True
                             save_wins(0)
                             self.audit(row.account, platform, 'awakening_skipped', {'observed': observed, 'delta_wins': 0}, day)
                         else:
                             step = 'awakening'
-                            remaining = 0 if observed >= 14 else max(0, settings.awakening_count - base)
+                            remaining = max(0, awake_target - base)
                             result = run_awakening(self.config, self.device, layer=settings.awakening_layer, count=remaining,
                                 on_progress=save_wins, assist=selection, kirin=settings.awakening_kirin)
                             verified = verified or getattr(result, 'assist_verified', False)
+                            target_reached = False
                             if verified:
                                 save_wins(result.completed)
-                                if getattr(result, 'daily_target_reached', False): progress.awakening_daily_done = True
-                                if result.success and result.completed == 0:
+                                target_reached = progress.awakening_completed >= awake_target
+                                if result.success and target_reached:
+                                    progress.awakening_daily_done = True
+                                if result.success and target_reached and result.completed == 0:
                                     self.audit(row.account, platform, 'awakening_skipped', {'observed': observed, 'delta_wins': 0}, day)
-                            if not result.success or not verified:
+                            if not result.success or not verified or not target_reached:
                                 account_failed = True
-                                self.audit(row.account, platform, 'task_error', {'step': step, 'reason': getattr(result, 'reason', 'assist_unverified')}, day)
+                                reason = (getattr(result, 'reason', '') or
+                                          ('assist_unverified' if not verified else 'assist_target_not_reached'))
+                                self.audit(row.account, platform, 'task_error', {'step': step, 'reason': reason}, day)
                         self.config.save()
                         self.goto_page(page_main)
+                now = datetime.now()
+                if now.date().isoformat() != day or window(now, platform)[1] != started:
+                    raise RequestHumanTakeover('收尾期间跨午夜或勾协刷新边界，停止本批后续步骤')
                 if account_failed:
                     failed.append(row.account)
                 else:

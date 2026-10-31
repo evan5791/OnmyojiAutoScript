@@ -146,12 +146,12 @@ class PersistentScheduleTests(unittest.TestCase):
         self.settings.daytime_jitter_minutes = 180
         self.settings.evening_run_time = time(18)
         self.settings.evening_jitter_minutes = 180
-        self.settings.ios_daily_run_time = time(5, 59)
+        self.settings.ios_daily_run_time = time(23, 59)
         self.settings.ios_daily_jitter_minutes = 180
         with patch('tasks.AccountSwitch.routine.random.randint', side_effect=[10800, -10800, 10800]):
             self.assertEqual(sample(self.runtime, self.settings, 'daytime', '2026-10-31')['at'], '2026-10-31T17:59:59')
             self.assertEqual(sample(self.runtime, self.settings, 'evening', '2026-10-31')['at'], '2026-10-31T18:00:00')
-            self.assertEqual(sample(self.runtime, self.settings, 'ios_daily', '2026-10-31')['at'], '2026-11-01T05:59:59')
+            self.assertEqual(sample(self.runtime, self.settings, 'ios_daily', '2026-10-31')['at'], '2026-10-31T23:59:59')
 
     def test_first_service_start_after_past_slots_never_runs_catchup(self):
         now = datetime(2026, 10, 31, 21)
@@ -212,11 +212,19 @@ class PersistentScheduleTests(unittest.TestCase):
         target = arm_future(self.runtime, self.settings, 'android', datetime(2026, 10, 31, 20, 2))
         self.assertEqual(target['at'], '2026-11-01T17:00:00')
 
-    def test_ios_has_independent_six_to_six_day_and_early_clock(self):
+    def test_ios_has_independent_midnight_day_and_early_clock(self):
         self.settings.ios_daily_run_time = time(1)
         target = arm_future(self.runtime, self.settings, 'ios', datetime(2026, 10, 31, 20))
         self.assertEqual(target['at'], '2026-11-01T01:00:00')
-        self.assertEqual(window(datetime(2026, 11, 1, 1), 'ios')[1], datetime(2026, 10, 31, 6))
+        self.assertEqual(window(datetime(2026, 11, 1, 1), 'ios')[1], datetime(2026, 11, 1))
+        self.assertEqual(window(datetime(2026, 10, 31, 23, 59, 59), 'ios')[2], datetime(2026, 11, 1))
+
+    def test_ios_retry_stops_at_midnight_while_android_jade_period_remains_evening(self):
+        self.arm()
+        target = finish(self.runtime, self.settings, 'ios', datetime(2026, 10, 31, 23, 55),
+                        failed=True, attempted=datetime(2026, 10, 31))
+        self.assertEqual((target['kind'], target['at']), ('plan', '2026-11-01T20:00:00'))
+        self.assertEqual(window(datetime(2026, 11, 1, 0, 5), 'android')[1], datetime(2026, 10, 31, 18))
 
     def test_disabling_one_platform_does_not_disable_the_other(self):
         self.arm()

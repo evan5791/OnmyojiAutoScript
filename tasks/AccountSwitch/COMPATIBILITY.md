@@ -13,4 +13,8 @@
 
 任务到点后的环境准备仍归原 `ScriptRuntimeController`；设备构造阶段的人工接管或原程序退出规则保持原样。只对已知的小号任务页面、截图、ADB 异常安排原刷新窗口内的重试。共享 OCR 是否预热继续取决于原壳配置，不应将“等待不额外初始化设备”理解成整个原壳完全不启动 OCR。
 
+领取与悬赏继续调用安装目录现有的原任务，不另建领取引擎：旧 dev 使用 `LoginHandler.harvest_mail/harvest_courtyard_affairs`，较新版本使用 `DailyTrifles` 原方法。当前本地较新版本的空邮箱曾因“一键领取”按钮常驻而持续重置计时，已仅在原 `DailyTrifles.run_pickup_email` 中将领取窗口设为6秒、移除该按钮分支的 `timeout_timer.reset()`，其余动作与导航保留。旧 dev 的 `harvest_mail` 本来就是不重置的6秒窗口，无需重复修改。不要用这份旧 dev 的完整 `DailyTrifles` 文件覆盖较新安装。
+
+勾协执行接口也有版本差异：较新版本的 `execute_mission(num_want)` 直接调用原方法，旧 dev 的三参数接口才由本模块补齐参数；原方法内部的错误不得被当作版本差异吞掉后重试。
+
 可通过环境变量 `OAS_ACCOUNT_SWITCH_COMPAT_SCRIPT` 指向待验证的新版 `script.py`，运行 `python -m unittest tasks.AccountSwitch.test_compat_runtime`。测试只解析指定文件的 AST，用 stub 执行改动方法；不导入其顶层设备/OCR模块，不操作真实设备。未设置变量且当前 checkout 是旧调度器时，此组测试跳过；旧壳由 `test_service.py` 覆盖。

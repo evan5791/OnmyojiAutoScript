@@ -147,14 +147,17 @@ class DailyFlowTests(unittest.TestCase):
         self.assertEqual(config.daily_trifles.done_record.pickup_email_dt.year, 2023)
         config.save.assert_not_called()
 
-    def test_routine_record_survives_midnight_but_not_the_next_six_oclock(self):
+    def test_daily_record_uses_midnight_independently_of_jade_refresh(self):
         routine_day = date(2026, 10, 31)
         daily = _RoutineDailyConfig()
         daily._routine_day = routine_day
         for completed_at, expected in [
-            (datetime(2026, 10, 31, 5, 59), False),
+            (datetime(2026, 10, 30, 23, 59), False),
+            (datetime(2026, 10, 31, 0, 0), True),
+            (datetime(2026, 10, 31, 5, 59), True),
             (datetime(2026, 10, 31, 6, 0), True),
-            (datetime(2026, 11, 1, 0, 5), True),
+            (datetime(2026, 10, 31, 23, 59), True),
+            (datetime(2026, 11, 1, 0, 0), False),
             (datetime(2026, 11, 1, 6, 0), False),
         ]:
             with self.subTest(completed_at=completed_at):
@@ -167,7 +170,8 @@ class DailyFlowTests(unittest.TestCase):
         with patch('tasks.AccountSwitch.flows.AccountDailyTask') as task:
             task.return_value.run.side_effect = TaskEnd
             result = run_daily(config, object(), record, routine_day='2026-10-31')
-        self.assertTrue(result.success)
+        self.assertFalse(result.success)
+        self.assertIn('pickup_email',result.pending)
 
     def test_courtyard_step_already_done_for_the_routine_is_not_repeated(self):
         task = AccountDailyTask.__new__(AccountDailyTask)
@@ -334,16 +338,18 @@ class AwakeningFlowTests(unittest.TestCase):
             # upstream GeneralBattle rather than the newer local engine.
             self.assertFalse(battle_wait_options.options['preset'].preset_enable)
             self.assertFalse(battle_wait_options.options['green'].green_enable)
+            self.assertFalse(battle_wait_options.options['prepare'].lock_team)
             self.assertEqual(battle_wait_options.options['completion'].check_imgs, [task.I_EVOZONE_FIRE])
             return True
 
         task.run_general_battle = battle
         original = battle_wait_options.options
-        with battle_wait_options(preset={'preset_enable': True}, green={'green_enable': True}):
+        with battle_wait_options(preset={'preset_enable': True}, green={'green_enable': True}, prepare={'lock_team': True}):
             parent_options = battle_wait_options.options
             self.assertTrue(task.run_counted(1, None).success)
             self.assertIs(battle_wait_options.options, parent_options)
             self.assertTrue(parent_options['preset'].preset_enable)
+            self.assertTrue(parent_options['prepare'].lock_team)
         self.assertIs(battle_wait_options.options, original)
 
     def test_lost_battle_preserves_partial_wins_and_retry_only_runs_remaining_count(self):
@@ -383,6 +389,7 @@ class AwakeningFlowTests(unittest.TestCase):
         config.evo_zone.switch_soul_config.enable = True
         config.evo_zone.switch_soul_config.enable_switch_by_name = True
         config.evo_zone.general_battle_config.preset_enable = True
+        config.evo_zone.general_battle_config.lock_team_enable = True
         before = config.evo_zone.model_dump()
 
         def make_task(isolated, device):
@@ -397,7 +404,7 @@ class AwakeningFlowTests(unittest.TestCase):
             self.assertFalse(evo.switch_soul_config.enable)
             self.assertFalse(evo.switch_soul_config.enable_switch_by_name)
             self.assertFalse(evo.general_battle_config.preset_enable)
-            self.assertTrue(evo.general_battle_config.lock_team_enable)
+            self.assertFalse(evo.general_battle_config.lock_team_enable)
             isolated.task_delay('EvoZone', success=True)
             isolated.save()
             return SimpleNamespace(run_counted=Mock(return_value=AwakeningResult(14, 14, True)))
@@ -441,14 +448,14 @@ class ModernBattleLifecycleTests(unittest.TestCase):
             quick_exit:bool=True
             preset_enable:bool=True
             green_enable:bool=True
-            lock_team_enable:bool=False
+            lock_team_enable:bool=True
         task.config.evo_zone.general_battle_config=NativeConfig(battle_timeout=timeout)
         def battle(config=None,buff=None,battle_key='default',exit_matcher=None):
             self.assertIs(exit_matcher,task.I_EVOZONE_FIRE)
             self.assertEqual(battle_key,'account_switch_awakening')
             self.assertFalse(config.preset_enable)
             self.assertFalse(config.green_enable)
-            self.assertTrue(config.lock_team_enable)
+            self.assertFalse(config.lock_team_enable)
             self.assertFalse(config.continuous_battle)
             self.assertFalse(config.quick_exit)
             self.assertEqual(config.max_continuous,0)
@@ -469,6 +476,7 @@ class ModernBattleLifecycleTests(unittest.TestCase):
         self.assertEqual(task.called_config.battle_timeout,420)
         self.assertEqual(original.battle_timeout,-1)
         self.assertTrue(original.preset_enable);self.assertTrue(original.continuous_battle)
+        self.assertTrue(original.lock_team_enable)
 
     def test_modern_positive_native_timeout_is_preserved(self):
         task=self.make_task(timeout=37)
@@ -589,15 +597,77 @@ class NativeAssistedAwakeningTests(unittest.TestCase):
         self.assertFalse(result.success);self.assertEqual(result.completed,1);self.assertEqual(wins,[1])
         self.assertTrue(result.assist_verified);self.assertFalse(result.daily_target_reached)
 
-    def test_zero_with_a_low_counter_never_claims_the_daily_target_complete(self):
+    def test_zero_request_returns_verified_without_claiming_fourteen_or_fighting(self):
         result=self.task.run_counted(0,None,assist=self.selection)
-        self.assertFalse(result.success);self.assertFalse(result.daily_target_reached)
+        self.assertTrue(result.success);self.assertTrue(result.assist_verified)
+        self.assertFalse(result.daily_target_reached);self.assertEqual(result.completed,0)
+        self.leave.assert_called_once()
         self.task.run_general_battle.assert_not_called()
 
-    def test_relock_failure_preserves_the_first_confirmed_win(self):
+    def test_zero_request_requires_confirmed_exit_even_with_a_verified_counter(self):
+        self.leave.return_value=False
+        result=self.task.run_counted(0,None,assist=self.selection)
+        self.assertFalse(result.success);self.assertEqual(result.reason,'assist_exit_unconfirmed')
+        self.task.run_general_battle.assert_not_called()
+
+    def test_next_challenge_unlock_failure_preserves_the_first_confirmed_win(self):
         self.task.check_lock.side_effect=[True,False]
         wins=[];result=self.task.run_counted(14,wins.append,assist=self.selection)
         self.assertFalse(result.success);self.assertEqual(result.completed,1);self.assertEqual(wins,[1])
+        self.assertEqual(result.reason,'assist_unlock_unconfirmed')
+        self.assertEqual([call.args for call in self.task.check_lock.call_args_list],[(False,),(False,)])
+        self.task.run_general_battle.assert_called_once()
+
+    def test_fourteen_unlocked_battles_each_require_fresh_assist_proof_with_incrementing_count(self):
+        expected_counts=[]
+        def verify(task,selection):
+            expected_counts.append(selection.normal_used)
+            self.assertEqual(task.run_general_battle.call_count,selection.normal_used)
+            self.assertEqual(task.check_lock.call_args.args,(False,))
+            return AssistProof(selection.normal_used,selection.normal_used,True)
+        self.proof.side_effect=verify
+        wins=[]
+        result=self.task.run_counted(14,wins.append,assist=self.selection)
+        self.assertTrue(result.success)
+        self.assertTrue(result.daily_target_reached)
+        self.assertEqual((result.normal_used,result.card_used,result.completed),(0,0,14))
+        self.assertEqual(expected_counts,list(range(14)))
+        self.assertEqual(wins,list(range(1,15)))
+        self.assertEqual(self.task.check_lock.call_count,14)
+        self.assertTrue(all(call.args==(False,) for call in self.task.check_lock.call_args_list))
+        self.leave.assert_not_called()
+
+    def test_resumed_counts_and_result_keep_the_initial_baseline(self):
+        self.selection=AssistSelection('friend',11,11)
+        seen=[]
+        def verify(task,selection):
+            seen.append((selection.normal_used,selection.card_used))
+            return AssistProof(selection.normal_used,selection.normal_used,True)
+        self.proof.side_effect=verify
+        result=self.task.run_counted(3,None,assist=self.selection)
+        self.assertEqual(seen,[(11,11),(12,12),(13,13)])
+        self.assertEqual((result.normal_used,result.card_used,result.completed),(11,11,3))
+        self.assertTrue(result.daily_target_reached)
+
+    def test_next_preparation_proof_failure_keeps_first_win_and_never_starts_second_battle(self):
+        self.proof.side_effect=[AssistProof(0,0,True),AssistError('assist_count_mismatch')]
+        wins=[]
+        result=self.task.run_counted(14,wins.append,assist=self.selection)
+        self.assertFalse(result.success)
+        self.assertEqual((result.completed,result.card_used,result.reason),(1,0,'assist_count_mismatch'))
+        self.assertEqual(wins,[1])
+        self.assertEqual([call.args[1].normal_used for call in self.proof.call_args_list],[0,1])
+        self.task.run_general_battle.assert_called_once()
+        self.leave.assert_called_once()
+
+    def test_next_preparation_missing_deployment_does_not_reuse_first_proof(self):
+        self.proof.side_effect=[AssistProof(0,0,True),AssistProof(1,1,False)]
+        wins=[]
+        result=self.task.run_counted(2,wins.append,assist=self.selection)
+        self.assertFalse(result.success)
+        self.assertEqual(result.reason,'assist_remaining_zero_or_undeployed')
+        self.assertEqual(wins,[1])
+        self.task.run_general_battle.assert_called_once()
 
 
 class AwakeningLayerTests(unittest.TestCase):

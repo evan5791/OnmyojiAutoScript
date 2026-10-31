@@ -37,7 +37,7 @@ class RefreshPeriodTests(unittest.TestCase):
                 self.assertEqual(period.end, datetime.fromisoformat(end))
                 self.assertEqual(period.evening, evening)
 
-    def test_midnight_retains_the_same_evening_and_routine_day(self):
+    def test_midnight_retains_the_same_jade_evening_period(self):
         before_midnight = refresh_period(datetime(2026, 10, 31, 23, 59))
         after_midnight = refresh_period(datetime(2026, 11, 1, 1))
         self.assertEqual(before_midnight, after_midnight)
@@ -210,7 +210,7 @@ class RoutineWorkflowTests(unittest.TestCase):
         task.config.save.side_effect = lambda: self.snapshots.append(AccountSwitch.model_validate_json(model.model_dump_json()))
         return task
 
-    def execute(self, task, now, jade_results=None, daily=None, awakening=None, login=None, clock_state=None, batch_platform=None):
+    def execute(self, task, now, jade_results=None, daily=None, awakening=None, login=None, clock_state=None, batch_platform=None, observed=0):
         jade_results = iter(jade_results or [SimpleNamespace(status='completed', pending=None, reason='')])
 
         def switch(config, device, account):
@@ -245,7 +245,7 @@ class RoutineWorkflowTests(unittest.TestCase):
                 patch('tasks.AccountSwitch.flows.run_awakening', side_effect=awakening or awakening_default) as awakening_flow, \
                 patch('tasks.AccountSwitch.jade.JadeCooperationTask') as jade_task, \
                 patch('tasks.AccountSwitch.cooperation.prepare_cooperation_assist',
-                      return_value=SimpleNamespace(friend='5791',normal_used=0,card_used=0)), \
+                      return_value=SimpleNamespace(friend='5791',normal_used=observed,card_used=observed)), \
                 patch('tasks.AccountSwitch.script_task.logger'):
             if clock_state is None:
                 clock.now.return_value = now
@@ -384,8 +384,8 @@ class RoutineWorkflowTests(unittest.TestCase):
             on_progress(count)
             return SimpleNamespace(requested=count, completed=count, success=True)
 
-        _, daily, _, jade = self.execute(task, now, awakening=awakening)
-        self.assertEqual([event[3] for event in self.events if event[0] == 'awakening'], [8, 14])
+        _, daily, _, jade = self.execute(task, now, awakening=awakening, observed=6)
+        self.assertEqual([event[3] for event in self.events if event[0] == 'awakening'], [8, 8])
         self.assertEqual(daily.call_count, 1)
         jade.assert_not_called()
         self.assertTrue(any(snapshot.runtime.accounts['alt01@163.com|android'].awakening_completed == 10 for snapshot in self.snapshots))
@@ -408,12 +408,12 @@ class RoutineWorkflowTests(unittest.TestCase):
 
         restored = AccountSwitch.model_validate_json(task.config.account_switch.model_dump_json())
         resumed = self.make_task(saved=restored)
-        _, daily, awakening, jade = self.execute(resumed, datetime(2026, 10, 31, 20, 10))
+        _, daily, awakening, jade = self.execute(resumed, datetime(2026, 10, 31, 20, 10), observed=5)
         daily.assert_not_called()
         jade.assert_not_called()
         self.assertEqual(awakening.call_args.kwargs['count'], 9)
 
-    def test_completed_evening_does_not_repeat_after_midnight_but_next_evening_resets(self):
+    def test_completed_schedule_waits_for_next_evening_but_manual_midnight_batch_uses_new_day(self):
         task = self.make_task(count=2)
         self.execute(task, datetime(2026, 10, 31, 20))
         restored = AccountSwitch.model_validate_json(task.config.account_switch.model_dump_json())
@@ -423,6 +423,12 @@ class RoutineWorkflowTests(unittest.TestCase):
         daily.assert_not_called()
         awakening.assert_not_called()
         jade.assert_not_called()
+
+        manual = self.make_task(saved=AccountSwitch.model_validate_json(restored.model_dump_json()))
+        switches, daily, awakening, jade = self.execute(manual, datetime(2026, 11, 1, 1), batch_platform='android')
+        self.assertEqual((switches.call_count, daily.call_count, awakening.call_count), (2, 2, 2))
+        jade.assert_not_called()
+        self.assertTrue(all(progress.day == '2026-11-01' for progress in manual.config.account_switch.runtime.accounts.values()))
 
         next_evening = self.make_task(saved=AccountSwitch.model_validate_json(restored.model_dump_json()))
         switches, daily, awakening, jade = self.execute(next_evening, datetime(2026, 11, 1, 20))

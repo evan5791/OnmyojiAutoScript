@@ -161,7 +161,7 @@ class _RoutineDailyConfig(DailyTrifles):
         if self._routine_day is None:
             within_routine = completed_at is not None and completed_at.date() == datetime.now().date()
         else:
-            start = datetime.combine(self._routine_day, time(hour=6))
+            start = datetime.combine(self._routine_day, time.min)
             within_routine = completed_at is not None and start <= completed_at < start + timedelta(days=1)
         if mode == 'guild_donate':
             if not within_routine:
@@ -411,7 +411,7 @@ class AccountAwakeningTask(AccountDialogGuard, EvoTask, AccountFlowAssets):
         return wait_for(self,lambda:self.appear(self.I_FORM_TEAM) or self.appear(self.I_EVOZONE_FIRE),25,
                         action=lambda:self.appear_then_click(rule,interval=1))
 
-    def check_lock(self,lock=True):
+    def check_lock(self,lock=False):
         target,button=(self.I_EVOZONE_LOCK,self.I_EVOZONE_UNLOCK) if lock else (self.I_EVOZONE_UNLOCK,self.I_EVOZONE_LOCK)
         return wait_for(self,lambda:self.appear(target),12,
                         action=lambda:self.appear_then_click(button,interval=1))
@@ -464,42 +464,47 @@ class AccountAwakeningTask(AccountDialogGuard, EvoTask, AccountFlowAssets):
         settings=self.config.evo_zone
         if not self._select_account_layer(settings.evo_zone_config.layer):
             return AwakeningResult(requested,0,False,'layer_not_found')
-        proof=None;started=False
+        proof=None
         def result(completed,success,reason=''):
             return AwakeningResult(requested,completed,success,reason,proof is not None,
                                    proof.normal_used if proof else None,proof.card_used if proof else None,
                                    bool(proof and proof.card_used+completed>=14))
-        if assist is not None:
-            if not self.check_lock(False): return result(0,False,'assist_unlock_unconfirmed')
-            if not click_until_gone(self,self.I_EVOZONE_FIRE,interval=1,timeout=20,confirm_frames=2,max_clicks=2):
-                return result(0,False,'challenge_not_started')
-            try: proof=prepare_battle_assist(self,assist)
-            except AssistError as exc:
-                leave_preparation(self)
-                return result(0,False,str(exc))
-            if proof.card_used>=14:
-                left=leave_preparation(self)
-                return result(0,left,'assist_daily_target_already_reached' if left else 'assist_exit_unconfirmed')
-            if count==0 or not proof.deployed:
-                leave_preparation(self)
-                return result(0,False,'assist_remaining_zero_or_undeployed')
-            count=min(count,14-proof.card_used)
-            if not click_until_gone(self,self.I_PREPARE_HIGHLIGHT,interval=1,timeout=12,confirm_frames=2,max_clicks=2):
-                leave_preparation(self)
-                return result(0,False,'assist_prepare_unconfirmed')
-            started=True
-        else: self.check_lock(True)
         completed=0
-        while completed<count:
-            if not started:
-                if not wait_for(self,lambda:self.appear(self.I_EVOZONE_FIRE),20):
-                    return result(completed,False,'challenge_page_missing')
-                if not click_until_gone(self,self.I_EVOZONE_FIRE,interval=1,timeout=20,confirm_frames=2,max_clicks=10):
-                    return result(completed,False,'challenge_not_started')
-                if assist is not None and self.appear(self.I_PREPARE_HIGHLIGHT):
+        while completed<count or (assist is not None and proof is None):
+            if not wait_for(self,lambda:self.appear(self.I_EVOZONE_FIRE),20):
+                return result(completed,False,'challenge_page_missing')
+            if not self.check_lock(False):
+                return result(completed,False,'assist_unlock_unconfirmed' if assist is not None else 'unlock_unconfirmed')
+            if not click_until_gone(self,self.I_EVOZONE_FIRE,interval=1,timeout=20,confirm_frames=2,
+                                    max_clicks=2 if assist is not None else 10):
+                return result(completed,False,'challenge_not_started')
+            if assist is not None:
+                expected_used = proof.card_used + completed if proof is not None else assist.normal_used
+                expected = AssistSelection(assist.friend, expected_used,
+                                           expected_used if assist.card_used is not None else None,
+                                           assist.portrait)
+                try:
+                    current_proof=prepare_battle_assist(self,expected)
+                except AssistError as exc:
                     leave_preparation(self)
-                    return result(completed,False,'assist_unverified_preparation_reappeared')
-            started=False
+                    return result(completed,False,str(exc))
+                if proof is None:
+                    # Keep the initial counter as the result/callback baseline;
+                    # later per-battle proofs already include completed wins.
+                    proof=current_proof
+                    count=min(count,14-proof.card_used)
+                if proof.card_used+completed>=14:
+                    left=leave_preparation(self)
+                    return result(completed,left,'assist_daily_target_already_reached' if left else 'assist_exit_unconfirmed')
+                if count==0:
+                    left=leave_preparation(self)
+                    return result(completed,left,'assist_verified_no_remaining_request' if left else 'assist_exit_unconfirmed')
+                if not current_proof.deployed:
+                    leave_preparation(self)
+                    return result(completed,False,'assist_remaining_zero_or_undeployed')
+                if not click_until_gone(self,self.I_PREPARE_HIGHLIGHT,interval=1,timeout=12,confirm_frames=2,max_clicks=2):
+                    leave_preparation(self)
+                    return result(completed,False,'assist_prepare_unconfirmed')
             won=self._run_account_battle(settings.general_battle_config)
             if not won:return result(completed,False,'battle_lost')
             # A native win may precede the final transition out of settlement.
@@ -508,8 +513,6 @@ class AccountAwakeningTask(AccountDialogGuard, EvoTask, AccountFlowAssets):
                 return result(completed,False,'battle_return_unconfirmed')
             completed+=1
             if on_progress is not None:on_progress(completed)
-            if assist is not None and completed==1 and completed<count and not self.check_lock(True):
-                return result(completed,False,'assist_relock_unconfirmed')
         return result(completed,True,'assist_daily_target_reached' if proof and proof.card_used+completed>=14 else '')
 
     def _run_account_battle(self, config) -> bool:
@@ -517,12 +520,12 @@ class AccountAwakeningTask(AccountDialogGuard, EvoTask, AccountFlowAssets):
         if battle_wait_options is not None:
             with battle_wait_options(completion={'check_imgs':[self.I_EVOZONE_FIRE]},
                                      preset={'preset_enable':False},green={'green_enable':False},
-                                     prepare={'lock_team':True}):
+                                     prepare={'lock_team':False}):
                 return self.run_general_battle(config=config)
         native_config=config.model_copy(deep=True)
         native_config.preset_enable=False
         native_config.green_enable=False
-        native_config.lock_team_enable=True
+        native_config.lock_team_enable=False
         native_config.continuous_battle=False
         native_config.max_continuous=0
         native_config.quick_exit=False
@@ -568,7 +571,7 @@ def run_awakening(config, device, layer: int = 1, count: int = 14,
     battle = evo.general_battle_config
     battle.preset_enable = False
     battle.green_enable = False
-    battle.lock_team_enable = True
+    battle.lock_team_enable = False
     for field, value in (('continuous_battle', False), ('max_continuous', 0), ('quick_exit', False)):
         if hasattr(battle, field):
             setattr(battle, field, value)

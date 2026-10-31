@@ -12,11 +12,14 @@ _lock = threading.Lock()
 
 
 def record_event(config, account, platform, stage, details=None, *, day=None, occurred_at=None):
-    stamp = occurred_at or datetime.now(timezone(timedelta(hours=8)))
+    local_zone = timezone(timedelta(hours=8))
+    stamp = occurred_at or datetime.now(local_zone)
     if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=timezone(timedelta(hours=8)))
+        stamp = stamp.replace(tzinfo=local_zone)
+    else:
+        stamp = stamp.astimezone(local_zone)
     event = {'occurred_at': stamp.isoformat(timespec='seconds'),
-             'day': day or (stamp - timedelta(hours=6)).date().isoformat(),
+             'day': day or stamp.date().isoformat(),
              'account': account, 'platform': platform, 'stage': stage, 'details': details or {}}
     logger.info('小号记录 [%s/%s] %s %s', platform, account or '本轮', stage,
                 json.dumps(details or {}, ensure_ascii=False, default=str))

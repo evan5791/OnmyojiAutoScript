@@ -280,6 +280,54 @@ class UpstreamApiCompatibilityTests(unittest.TestCase):
             task.execute_mission(8)
         execute.assert_called_once_with(task, task.O_WQ_TEXT_ALL, 8, 0)
 
+    def test_modern_single_argument_mission_delegates_without_legacy_ocr(self):
+        task=JadeCooperationTask.__new__(JadeCooperationTask)
+        task.O_WQ_NUMBER=SimpleNamespace(ocr=Mock(side_effect=AssertionError('native task owns ticket OCR')))
+        calls=[]
+        def execute(native,num_want):
+            calls.append((native,num_want))
+            return False
+        with patch.object(WantedQuestsTask,'execute_mission',execute):
+            self.assertFalse(task.execute_mission(8))
+        self.assertEqual(calls,[(task,8)])
+        task.O_WQ_NUMBER.ocr.assert_not_called()
+
+    def test_modern_internal_type_error_is_not_retried_with_legacy_arguments(self):
+        task=JadeCooperationTask.__new__(JadeCooperationTask)
+        calls=[]
+        def execute(native,num_want):
+            calls.append(num_want)
+            raise TypeError('native strategy failed')
+        with patch.object(WantedQuestsTask,'execute_mission',execute):
+            with self.assertRaisesRegex(TypeError,'native strategy failed'):task.execute_mission(8)
+        self.assertEqual(calls,[8])
+
+    def test_modern_finder_preserves_native_edge_fallback(self):
+        task=JadeCooperationTask.__new__(JadeCooperationTask);image=object();calls=[]
+        def finder(native,frame,*,allow_edge_fallback=False):
+            calls.append((native,frame,allow_edge_fallback))
+            return (0,1,8,[1,2,3,4])
+        with patch.object(WantedQuestsTask,'find_wq',finder):
+            self.assertEqual(task.find_wq(image,allow_edge_fallback=True),(0,1,8,[1,2,3,4]))
+        self.assertEqual(calls,[(task,image,True)])
+
+    def test_modern_detail_opening_reuses_native_flow(self):
+        task=JadeCooperationTask.__new__(JadeCooperationTask);task._click_until=Mock()
+        calls=[]
+        def native(current):
+            calls.append(current)
+            return True
+        with patch.object(WantedQuestsTask,'open_wq_info',native,create=True):
+            self.assertTrue(task.open_wq_info())
+        self.assertEqual(calls,[task])
+        task._click_until.assert_not_called()
+
+    def test_old_detail_opening_uses_local_adapter_when_native_method_is_absent(self):
+        task=JadeCooperationTask.__new__(JadeCooperationTask);task._click_until=Mock(return_value=True)
+        with patch.object(WantedQuestsTask,'open_wq_info',None,create=True):
+            self.assertTrue(task.open_wq_info())
+        task._click_until.assert_called_once_with(task.O_WQ_TEXT_ALL,task.I_TRACE_TRUE,seconds=5)
+
     def test_new_trace_templates_are_shipped_with_the_feature(self):
         for rule in [JadeCooperationTask.I_JADE_TRACE_ENABLE_NEW, JadeCooperationTask.I_JADE_TRACE_DISABLE_NEW]:
             self.assertTrue(Path(rule.file).is_file(), rule.file)

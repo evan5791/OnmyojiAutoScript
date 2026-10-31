@@ -129,14 +129,181 @@ class NativeControllerTests(unittest.TestCase):
         self.assertEqual(self.model.runtime.accounts['one|android'].awakening_script_wins, 0)
         self.assertEqual(self.model.runtime.accounts['one|android'].awakening_observed, 14)
 
-    def test_saved_ten_and_observed_five_add_only_four_new_wins(self):
+    def test_saved_ten_does_not_replace_observed_five_when_computing_remaining(self):
         self.settings.accounts = 'one'
         self.model.runtime.accounts['one|android'] = AccountRoutineProgress(day='2026-10-31', awakening_completed=10)
         self.assist_mock.side_effect = lambda config, device, friend: SimpleNamespace(friend=friend, normal_used=5, card_used=5)
         self.run_task()
-        self.assertEqual(self.awake_mock.call_args.kwargs['count'], 4)
+        self.assertEqual(self.awake_mock.call_args.kwargs['count'], 9)
         self.assertEqual(self.model.runtime.accounts['one|android'].awakening_completed, 14)
-        self.assertEqual(self.model.runtime.accounts['one|android'].awakening_script_wins, 4)
+        self.assertEqual(self.model.runtime.accounts['one|android'].awakening_script_wins, 9)
+
+    def test_imported_one_unverified_win_does_not_reduce_fourteen_native_wins(self):
+        self.settings.accounts = 'one'
+        self.model.runtime.accounts['one|android'] = AccountRoutineProgress(
+            day='2026-10-31', awakening_completed=1, awakening_script_wins=1)
+        result = self.run_task()
+        progress = self.model.runtime.accounts['one|android']
+        self.assertEqual(self.awake_mock.call_args.kwargs['count'], 14)
+        self.assertEqual(progress.awakening_completed, 14)
+        self.assertEqual(progress.awakening_script_wins, 15)
+        self.assertEqual(progress.awakening_observed, 0)
+        self.assertEqual(result['status'], 'completed')
+
+    def test_native_pending_fourteen_with_ui_thirteen_adds_one_without_losing_history(self):
+        self.settings.accounts = 'one'
+        self.model.runtime.accounts['one|android'] = AccountRoutineProgress(
+            day='2026-10-31', awakening_completed=14, awakening_script_wins=113,
+            awakening_assist_friend='assist')
+        self.assist_mock.side_effect = lambda *args: SimpleNamespace(friend='assist', normal_used=13, card_used=13)
+        with patch.object(self.task, 'audit') as audit:
+            result = self.run_task()
+        progress = self.model.runtime.accounts['one|android']
+        self.assertEqual(self.awake_mock.call_args.kwargs['count'], 1)
+        self.assertEqual(progress.awakening_completed, 14)
+        self.assertEqual(progress.awakening_observed, 13)
+        self.assertEqual(progress.awakening_script_wins, 114)
+        self.assertTrue(progress.awakening_daily_done)
+        deltas = [call.args[3]['delta_wins'] for call in audit.call_args_list if call.args[2] == 'awakening_progress']
+        self.assertEqual(deltas, [1])
+        self.assertEqual(result['status'], 'completed')
+
+    def test_duplicate_cumulative_callbacks_and_final_result_do_not_double_count(self):
+        self.settings.accounts = 'one'
+        def partial(config, device, layer, count, on_progress, **kwargs):
+            for cumulative in (1, 1, 2, 1, 2): on_progress(cumulative)
+            return AwakeningResult(count, 2, False, 'interrupted', True)
+        self.awake_mock.side_effect = partial
+        with patch.object(self.task, 'audit') as audit:
+            result = self.run_task()
+        progress = self.model.runtime.accounts['one|android']
+        self.assertEqual(progress.awakening_completed, 2)
+        self.assertEqual(progress.awakening_script_wins, 2)
+        deltas = [call.args[3]['delta_wins'] for call in audit.call_args_list if call.args[2] == 'awakening_progress']
+        self.assertEqual(deltas, [1, 1])
+        self.assertFalse(progress.awakening_daily_done)
+        self.assertEqual(result['status'], 'account_routine_pending')
+
+    def test_thirteen_successful_native_battles_cannot_report_fourteen_complete(self):
+        self.settings.accounts = 'one'
+        self.model.runtime.accounts['one|android'] = AccountRoutineProgress(day='2026-10-31', awakening_completed=1)
+        def short(config, device, layer, count, on_progress, **kwargs):
+            on_progress(13)
+            return AwakeningResult(count, 13, True, assist_verified=True, daily_target_reached=True)
+        self.awake_mock.side_effect = short
+        result = self.run_task()
+        progress = self.model.runtime.accounts['one|android']
+        self.assertEqual(self.awake_mock.call_args.kwargs['count'], 14)
+        self.assertEqual(progress.awakening_completed, 13)
+        self.assertFalse(progress.awakening_daily_done)
+        self.assertEqual(result['status'], 'account_routine_pending')
+
+    def test_old_completed_fourteen_without_native_evidence_is_not_replayed_same_day(self):
+        self.settings.accounts = 'one'
+        self.model.runtime.accounts['one|android'] = AccountRoutineProgress(
+            day='2026-10-31', daily_done=True, awakening_completed=14, awakening_script_wins=14)
+        self.model.runtime.periods['2026-10-31T18:00:00|receiver'] = JadePeriodProgress(completed=True)
+        self.run_task()
+        self.switch_mock.assert_not_called()
+        self.awake_mock.assert_not_called()
+        self.assertEqual(self.model.runtime.accounts['one|android'].awakening_script_wins, 14)
+
+    def test_custom_five_finishes_once_then_increasing_target_resumes_from_ui(self):
+        self.settings.accounts = 'one'
+        self.settings.awakening_count = 5
+        self.run_task()
+        progress = self.model.runtime.accounts['one|android']
+        self.assertEqual(self.awake_mock.call_args.kwargs['count'], 5)
+        self.assertTrue(progress.awakening_daily_done)
+        self.awake_mock.reset_mock()
+        self.task.run_account_batch(self.settings, self.settings.get_account_rows(), 'android', 'receiver')
+        self.awake_mock.assert_not_called()
+        self.settings.awakening_count = 14
+        self.assist_mock.side_effect = lambda *args: SimpleNamespace(friend='assist', normal_used=5, card_used=5)
+        self.task.run_account_batch(self.settings, self.settings.get_account_rows(), 'android', 'receiver')
+        self.assertEqual(self.awake_mock.call_args.kwargs['count'], 9)
+        self.assertEqual(progress.awakening_script_wins, 14)
+        self.assertTrue(progress.awakening_daily_done)
+
+    def test_custom_goal_already_observed_skips_without_adding_script_wins(self):
+        self.settings.accounts = 'one'
+        self.settings.awakening_count = 5
+        self.assist_mock.side_effect = lambda *args: SimpleNamespace(friend='assist', normal_used=5, card_used=5)
+        self.run_task()
+        progress = self.model.runtime.accounts['one|android']
+        self.awake_mock.assert_not_called()
+        self.assertEqual(progress.awakening_completed, 5)
+        self.assertEqual(progress.awakening_script_wins, 0)
+        self.assertTrue(progress.awakening_daily_done)
+
+    def test_midnight_starts_new_account_day_but_keeps_evening_jade_slot(self):
+        self.settings.accounts = 'one'
+        self.now = datetime(2026, 11, 1, 0, 5)
+        self.model.runtime.accounts['one|android'] = AccountRoutineProgress(
+            day='2026-10-31', daily_done=True, awakening_completed=14, awakening_daily_done=True)
+        slot = JadePeriodProgress(completed=True)
+        self.model.runtime.periods['2026-10-31T18:00:00|receiver'] = slot
+        self.task.run_account_batch(self.settings, self.settings.get_account_rows(), 'android', 'receiver')
+        progress = self.model.runtime.accounts['one|android']
+        self.assertEqual(progress.day, '2026-11-01')
+        self.assertEqual(self.daily_mock.call_args.kwargs['routine_day'], '2026-11-01')
+        self.assertEqual(self.awake_mock.call_args.kwargs['count'], 14)
+        self.jade_mock.assert_not_called()
+        self.assertIs(self.model.runtime.periods['2026-10-31T18:00:00|receiver'], slot)
+
+    def test_cross_midnight_after_daily_stops_following_steps_and_accounts(self):
+        self.now = datetime(2026, 10, 31, 23, 59)
+        def daily_then_midnight(*args, **kwargs):
+            result = self.daily(*args, **kwargs)
+            self.now = datetime(2026, 11, 1)
+            return result
+        self.daily_mock.side_effect = daily_then_midnight
+        result = self.task.run_account_batch(self.settings, self.settings.get_account_rows(), 'android', 'receiver')
+        self.assertIn('refresh_boundary', result['failed_accounts'])
+        self.awake_mock.assert_not_called()
+        self.jade_mock.assert_not_called()
+        self.assertEqual(self.switch_mock.call_count, 1)
+        self.assertEqual(self.model.runtime.accounts['one|android'].day, '2026-10-31')
+
+    def test_callback_after_midnight_cannot_put_a_new_win_into_yesterdays_progress(self):
+        self.settings.accounts = 'one\ntwo'
+        self.now = datetime(2026, 10, 31, 23, 59)
+        def win_after_midnight(config, device, layer, count, on_progress, **kwargs):
+            self.now = datetime(2026, 11, 1)
+            on_progress(1)
+            raise AssertionError('A midnight callback must stop the flow')
+        self.awake_mock.side_effect = win_after_midnight
+        with patch.object(self.task, 'audit') as audit:
+            result = self.task.run_account_batch(self.settings, self.settings.get_account_rows(), 'android', 'receiver')
+        progress = self.model.runtime.accounts['one|android']
+        self.assertEqual(progress.day, '2026-10-31')
+        self.assertEqual(progress.awakening_completed, 0)
+        self.assertEqual(progress.awakening_script_wins, 0)
+        self.assertIn('refresh_boundary', result['failed_accounts'])
+        events = [call for call in audit.call_args_list if call.args[2] == 'awakening_progress']
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].args[4], '2026-11-01')
+        self.assertEqual(events[0].args[3]['delta_wins'], 1)
+
+    def test_login_crossing_midnight_stops_before_daily_or_battle(self):
+        self.now = datetime(2026, 10, 31, 23, 59)
+        def switch_at_midnight(config, device, account):
+            def enter():
+                self.now = datetime(2026, 11, 1)
+                return True
+            return SimpleNamespace(switchAccount=enter)
+        self.switch_mock.side_effect = switch_at_midnight
+        result = self.task.run_account_batch(self.settings, self.settings.get_account_rows(), 'android', 'receiver')
+        self.daily_mock.assert_not_called()
+        self.awake_mock.assert_not_called()
+        self.assertEqual(self.switch_mock.call_count, 1)
+        self.assertIn('refresh_boundary', result['failed_accounts'])
+
+    def test_audit_uses_actual_calendar_day_even_when_jade_period_started_yesterday(self):
+        self.now = datetime(2026, 11, 1, 0, 5)
+        with patch('tasks.AccountSwitch.history.record_event') as record:
+            self.task.audit('one', 'android', 'login', {}, '2026-10-31')
+        self.assertEqual(record.call_args.kwargs['day'], '2026-11-01')
 
     def test_new_unarmed_service_waits_for_future_without_logging_in(self):
         self.now = datetime(2026, 10, 31, 20, 30)
