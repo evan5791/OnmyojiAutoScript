@@ -533,4 +533,38 @@ class DialogGuardTests(unittest.TestCase):
         task.click.assert_not_called()
 
 
+class CooperationEntryTests(unittest.TestCase):
+    def test_entry_waits_for_stable_tab_and_retries_only_while_panel_is_missing(self):
+        task=CooperationTask.__new__(CooperationTask)
+        task.goto_page=Mock()
+        state={'frame':0,'clicks':0}
+        tab=OcrRow('协战',(1202,536,43,77),1)
+        def screenshots(*args):
+            for frame in range(6):
+                state['frame']=frame
+                yield
+        def read(current,rule):
+            if rule is task.O_ASSIST_PANEL:
+                return [OcrRow('每日协战次数',(760,100,170,30),1)] if state['clicks']==2 else []
+            return [tab]
+        def click(*args):state['clicks']+=1
+        with patch('tasks.AccountSwitch.cooperation.frames',screenshots), \
+                patch('tasks.AccountSwitch.cooperation.rows',side_effect=read), \
+                patch('tasks.AccountSwitch.cooperation.click_box',side_effect=click), \
+                patch('tasks.AccountSwitch.cooperation.monotonic',side_effect=lambda:state['frame']):
+            task.open_panel()
+        self.assertEqual(state['clicks'],2)
+        self.assertEqual(state['frame'],4)
+
+    def test_entry_without_recognized_tab_never_clicks_a_fixed_position(self):
+        task=CooperationTask.__new__(CooperationTask)
+        task.goto_page=Mock()
+        with patch('tasks.AccountSwitch.cooperation.frames',return_value=iter(range(4))), \
+                patch('tasks.AccountSwitch.cooperation.rows',return_value=[]), \
+                patch('tasks.AccountSwitch.cooperation.click_box') as click:
+            with self.assertRaisesRegex(AssistError,'cooperation_panel_unconfirmed'):
+                task.open_panel()
+        click.assert_not_called()
+
+
 if __name__=='__main__':unittest.main()

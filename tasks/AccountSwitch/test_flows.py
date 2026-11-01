@@ -610,15 +610,15 @@ class NativeAssistedAwakeningTests(unittest.TestCase):
         self.assertFalse(result.success);self.assertEqual(result.reason,'assist_exit_unconfirmed')
         self.task.run_general_battle.assert_not_called()
 
-    def test_next_challenge_unlock_failure_preserves_the_first_confirmed_win(self):
+    def test_verified_run_does_not_repeat_unlock_after_first_win(self):
         self.task.check_lock.side_effect=[True,False]
         wins=[];result=self.task.run_counted(14,wins.append,assist=self.selection)
-        self.assertFalse(result.success);self.assertEqual(result.completed,1);self.assertEqual(wins,[1])
-        self.assertEqual(result.reason,'assist_unlock_unconfirmed')
-        self.assertEqual([call.args for call in self.task.check_lock.call_args_list],[(False,),(False,)])
-        self.task.run_general_battle.assert_called_once()
+        self.assertTrue(result.success);self.assertEqual(result.completed,14)
+        self.assertEqual(wins,list(range(1,15)))
+        self.task.check_lock.assert_called_once_with(False)
+        self.assertEqual(self.task.run_general_battle.call_count,14)
 
-    def test_fourteen_unlocked_battles_each_require_fresh_assist_proof_with_incrementing_count(self):
+    def test_fourteen_unlocked_battles_verify_assist_once_before_first_battle(self):
         expected_counts=[]
         def verify(task,selection):
             expected_counts.append(selection.normal_used)
@@ -631,9 +631,9 @@ class NativeAssistedAwakeningTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertTrue(result.daily_target_reached)
         self.assertEqual((result.normal_used,result.card_used,result.completed),(0,0,14))
-        self.assertEqual(expected_counts,list(range(14)))
+        self.assertEqual(expected_counts,[0])
         self.assertEqual(wins,list(range(1,15)))
-        self.assertEqual(self.task.check_lock.call_count,14)
+        self.assertEqual(self.task.check_lock.call_count,1)
         self.assertTrue(all(call.args==(False,) for call in self.task.check_lock.call_args_list))
         self.leave.assert_not_called()
 
@@ -645,29 +645,40 @@ class NativeAssistedAwakeningTests(unittest.TestCase):
             return AssistProof(selection.normal_used,selection.normal_used,True)
         self.proof.side_effect=verify
         result=self.task.run_counted(3,None,assist=self.selection)
-        self.assertEqual(seen,[(11,11),(12,12),(13,13)])
+        self.assertEqual(seen,[(11,11)])
         self.assertEqual((result.normal_used,result.card_used,result.completed),(11,11,3))
         self.assertTrue(result.daily_target_reached)
 
-    def test_next_preparation_proof_failure_keeps_first_win_and_never_starts_second_battle(self):
+    def test_verified_proof_is_reused_for_remaining_battles(self):
         self.proof.side_effect=[AssistProof(0,0,True),AssistError('assist_count_mismatch')]
         wins=[]
         result=self.task.run_counted(14,wins.append,assist=self.selection)
-        self.assertFalse(result.success)
-        self.assertEqual((result.completed,result.card_used,result.reason),(1,0,'assist_count_mismatch'))
-        self.assertEqual(wins,[1])
-        self.assertEqual([call.args[1].normal_used for call in self.proof.call_args_list],[0,1])
-        self.task.run_general_battle.assert_called_once()
-        self.leave.assert_called_once()
+        self.assertTrue(result.success)
+        self.assertEqual((result.completed,result.card_used),(14,0))
+        self.assertEqual(wins,list(range(1,15)))
+        self.proof.assert_called_once()
+        self.assertEqual(self.task.run_general_battle.call_count,14)
+        self.leave.assert_not_called()
 
-    def test_next_preparation_missing_deployment_does_not_reuse_first_proof(self):
-        self.proof.side_effect=[AssistProof(0,0,True),AssistProof(1,1,False)]
+    def test_first_preparation_missing_deployment_never_starts_battle(self):
+        self.proof.return_value=AssistProof(0,0,False)
         wins=[]
         result=self.task.run_counted(2,wins.append,assist=self.selection)
         self.assertFalse(result.success)
         self.assertEqual(result.reason,'assist_remaining_zero_or_undeployed')
-        self.assertEqual(wins,[1])
-        self.task.run_general_battle.assert_called_once()
+        self.assertEqual(wins,[])
+        self.task.run_general_battle.assert_not_called()
+
+    def test_retry_invocation_requires_a_new_proof(self):
+        self.task.run_general_battle.side_effect=[True,False,True]
+        first=self.task.run_counted(2,None,assist=self.selection)
+        self.assertFalse(first.success)
+        self.proof.side_effect=AssistError('assist_count_mismatch')
+        second=self.task.run_counted(1,None,assist=AssistSelection('other_friend',1))
+        self.assertFalse(second.success)
+        self.assertFalse(second.assist_verified)
+        self.assertEqual(self.proof.call_count,2)
+        self.assertEqual(self.task.run_general_battle.call_count,2)
 
 
 class AwakeningLayerTests(unittest.TestCase):

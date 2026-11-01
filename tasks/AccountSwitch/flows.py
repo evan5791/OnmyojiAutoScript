@@ -473,26 +473,21 @@ class AccountAwakeningTask(AccountDialogGuard, EvoTask, AccountFlowAssets):
         while completed<count or (assist is not None and proof is None):
             if not wait_for(self,lambda:self.appear(self.I_EVOZONE_FIRE),20):
                 return result(completed,False,'challenge_page_missing')
-            if not self.check_lock(False):
+            if completed == 0 and not self.check_lock(False):
                 return result(completed,False,'assist_unlock_unconfirmed' if assist is not None else 'unlock_unconfirmed')
             if not click_until_gone(self,self.I_EVOZONE_FIRE,interval=1,timeout=20,confirm_frames=2,
                                     max_clicks=2 if assist is not None else 10):
                 return result(completed,False,'challenge_not_started')
-            if assist is not None:
-                expected_used = proof.card_used + completed if proof is not None else assist.normal_used
-                expected = AssistSelection(assist.friend, expected_used,
-                                           expected_used if assist.card_used is not None else None,
-                                           assist.portrait)
+            if assist is not None and proof is None:
                 try:
-                    current_proof=prepare_battle_assist(self,expected)
+                    current_proof=prepare_battle_assist(self,assist)
                 except AssistError as exc:
                     leave_preparation(self)
                     return result(completed,False,str(exc))
-                if proof is None:
-                    # Keep the initial counter as the result/callback baseline;
-                    # later per-battle proofs already include completed wins.
-                    proof=current_proof
-                    count=min(count,14-proof.card_used)
+                # This account's uninterrupted run keeps its verified formation.
+                # A new invocation (including a retry) starts with no proof.
+                proof=current_proof
+                count=min(count,14-proof.card_used)
                 if proof.card_used+completed>=14:
                     left=leave_preparation(self)
                     return result(completed,left,'assist_daily_target_already_reached' if left else 'assist_exit_unconfirmed')

@@ -9,6 +9,7 @@ from tasks.AccountSwitch.dialogs import AccountDialogGuard
 from tasks.AccountSwitch.assist import (AssistError, AssistSelection, click_box, frames,
                                       in_region, inside, rows, text)
 from module.atom.swipe import RuleSwipe
+from module.logger import logger
 
 
 def normal_usage(items):
@@ -58,22 +59,29 @@ class CooperationTask(AccountDialogGuard,GameUi,AccountFlowAssets):
 
     def open_panel(self):
         self.goto_page(page_friends)
-        clicked=False
+        clicks=stable=0;previous=[];next_click=0;diagnostic=None
         for _ in frames(self,20):
             panel=rows(self,self.O_ASSIST_PANEL)
             if any(row.text=='每日协战次数' and row.score>=.7 for row in panel):return
-            tabs=[row for row in rows(self,self.O_ASSIST_TAB) if row.text=='协战' and row.score>=.7]
+            glyphs=rows(self,self.O_ASSIST_TAB)
+            tabs=[row for row in glyphs if row.text=='协战' and row.score>=.7]
             # The shared OCR can split this vertical tab into two glyphs.
             if not tabs:
-                glyphs=rows(self,self.O_ASSIST_TAB)
                 for first in glyphs:
                     for second in glyphs:
                         if first.text=='协' and second.text=='战' and first.score>=.7 and second.score>=.7:
                             x,y,w,h=first.box;a,b,c,d=second.box
                             if b>y and b-y-h<22 and abs(x+w/2-a-c/2)<20:
                                 tabs=[type(first)('协战',(min(x,a),y,max(x+w,a+c)-min(x,a),b+d-y),min(first.score,second.score))]
-            if len(tabs)==1 and not clicked:
-                click_box(self,tabs[0].box,'account_cooperation_tab');clicked=True
+            observed=tuple((row.text,round(row.score,2)) for row in glyphs)
+            if observed!=diagnostic:
+                logger.info('协战入口识别：%s',observed)
+                diagnostic=observed
+            stable=stable+1 if tabs and self._same_card_rows(previous,tabs) else 1
+            previous=tabs
+            if len(tabs)==1 and stable>=2 and clicks<3 and monotonic()>=next_click:
+                click_box(self,tabs[0].box,'account_cooperation_tab')
+                clicks+=1;next_click=monotonic()+1.2
         raise AssistError('cooperation_panel_unconfirmed')
 
     def read_usage(self):
