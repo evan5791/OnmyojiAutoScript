@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta
 from datetime import datetime as _DateTime
+from time import monotonic, sleep
 
 from module.exception import (
     EmulatorNotRunningError, GameBugError, GameNotRunningError, GamePageUnknownError,
@@ -17,6 +18,27 @@ def _block(config):
 def _log(logger, message):
     if logger is not None:
         logger.info(message)
+
+
+def ensure_game_started(device, logger=None) -> None:
+    """Launch a closed game; AccountSwitch owns account selection and login."""
+    try:
+        if device.app_is_running():
+            return
+    except RequestHumanTakeover as exc:
+        raise GameNotRunningError('Cannot query game state before AccountSwitch') from exc
+    _log(logger, '小号切换前游戏未运行，启动游戏后交由小号流程校验登录')
+    device.app_start()
+    wait_ready = getattr(device, 'wait_app_start_ready', None)
+    if callable(wait_ready):
+        wait_ready()
+    # Older OAS devices have no startup-frame probe. Allow the asynchronous
+    # foreground transition to finish before the shell takes its first frame.
+    deadline = monotonic() + 15
+    while not device.app_is_running():
+        if monotonic() >= deadline:
+            raise GameNotRunningError('Game did not start before AccountSwitch')
+        sleep(0.5)
 
 
 def _routine_enabled(block):

@@ -576,6 +576,8 @@ class Script:
 
         try:
             try:
+                if command == 'AccountSwitch':
+                    account_service.ensure_game_started(self.device, logger=logger)
                 self.device.screenshot()
                 module_name = 'script_task'
                 module_path = str(Path.cwd() / 'tasks' / command / (module_name+'.py'))
