@@ -96,6 +96,13 @@ class CostumeConfig(BaseModel):
     costume_battle_type: BattleType = Field(default=BattleType.COSTUME_BATTLE_DEFAULT, description='costume_battle_type_help')
     costume_battle_scene_type: BattleSceneType = Field(default=BattleSceneType.COSTUME_BATTLE_SCENE_DEFAULT, description='costume_battle_scene_type_help')
 
+    @field_validator('costume_main_type', mode='before')
+    @classmethod
+    def accept_single_courtyard_selection(cls, value):
+        if isinstance(value, list) and len(value) == 1:
+            return value[0]
+        return value
+
     @field_validator('costume_realm_type', mode='before')
     @classmethod
     def validate_realm(cls, v):

@@ -14,6 +14,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from module.logger import logger
 from module.server.home_router import home_app
 from module.server.script_router import script_app
+from module.server.config_transfer_router import script_app as config_transfer_app
+from module.server.log_router import log_app
+from module.server.stats_router import stats_app
+from module.server.api_logger import ensure_api_logger
 from module.server.tool_router import tool_app
 from module.server.setting import State
 from module.server.main_manager import mm
@@ -43,6 +47,9 @@ app.add_middleware(
 
 app.include_router(home_app)
 app.include_router(script_app)
+app.include_router(config_transfer_app)
+app.include_router(log_app)
+app.include_router(stats_app)
 app.include_router(tool_app)
 
 annotator_static_dir = Path(__file__).resolve().parent / "web" / "annotator" / "static"
@@ -71,6 +78,7 @@ async def on_startup():
     app.state 的生命周期在定义app的时候就有了
     :return:
     """
+    ensure_api_logger()
     logger.info('OAS web service startup done')
     if app.state.script_instances:
         await mm.restart_processes(app.state.script_instances)

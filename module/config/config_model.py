@@ -2,7 +2,8 @@
 # @author runhey
 # github https://github.com/runhey
 from tasks.GuildActivityMonitor.config import GuildActivityMonitor
-from typing import Dict, Any
+from typing import Dict, Any, get_args, get_origin
+from copy import deepcopy
 
 import re
 import inflection
@@ -157,11 +158,16 @@ class ConfigModel(ConfigBase):
     guild_activity_monitor: GuildActivityMonitor = Field(default_factory=GuildActivityMonitor)
     budokai_tournament: BudokaiTournament = Field(default_factory=BudokaiTournament)
 
-    def __init__(self, config_name: str=None) -> None:
+    def __init__(self, config_name: str=None, **data) -> None:
         """
 
         :param config_name:
         """
+        if data:
+            if config_name:
+                data['config_name'] = config_name
+            super().__init__(**data)
+            return
         if not config_name:
             super().__init__()
             return
@@ -199,7 +205,39 @@ class ConfigModel(ConfigBase):
         :return:
         """
         filepath = Path.cwd() / "config" / f"{config_name}.json"
+        if filepath.exists():
+            previous = read_file(filepath)
+            data = ConfigModel._preserve_unmodeled_fields(data, previous, ConfigModel)
         write_file(filepath, data)
+
+    @staticmethod
+    def _preserve_unmodeled_fields(data: dict, previous: dict, model_type) -> dict:
+        """Retain newer-shell options without resurrecting deleted runtime keys."""
+        result = dict(data)
+        for key, old_value in previous.items():
+            field = model_type.model_fields.get(key)
+            annotation = field.annotation if field is not None else None
+            dynamic = False
+            if field is None:
+                for name, candidate in model_type.model_fields.items():
+                    if re.fullmatch(re.escape(name) + r'_\d+', key) and get_origin(candidate.annotation) is list:
+                        arguments = get_args(candidate.annotation)
+                        annotation = arguments[0] if arguments else None
+                        dynamic = True
+                        break
+                if not dynamic:
+                    if key not in result:
+                        result[key] = deepcopy(old_value)
+                    continue
+            if key not in result:
+                continue
+            try:
+                nested_model = isinstance(annotation, type) and issubclass(annotation, BaseModel)
+            except TypeError:
+                nested_model = False
+            if nested_model and isinstance(old_value, dict) and isinstance(result[key], dict):
+                result[key] = ConfigModel._preserve_unmodeled_fields(result[key], old_value, annotation)
+        return result
 
     def gui_args(self, task: str) -> str:
         """

@@ -9,13 +9,26 @@ from datetime import datetime
 from module.config.utils import convert_to_underscore
 
 from module.logger import logger
+from module.server.api_logger import ApiLoggingRoute
+from module.exception import RequestHumanTakeover
 from module.server.main_manager import mm
 from module.server.script_process import ScriptProcess, ScriptState
 
 from tasks.Component.config_base import TimeDelta
 
 
-script_app = APIRouter()
+script_app = APIRouter(route_class=ApiLoggingRoute)
+
+
+def connection_schedule(config):
+    """An inactive profile remains connectable before any task is enabled."""
+    try:
+        config.get_next()
+    except RequestHumanTakeover:
+        if config.pending_task or config.waiting_task:
+            raise
+        return {'running': {}, 'pending': [], 'waiting': []}
+    return config.get_schedule_data()
 
 
 @script_app.get('/test')
@@ -211,8 +224,7 @@ async def websocket_endpoint(websocket: WebSocket, script_name: str):
     try:
         await script_process.send_json(websocket, {"state": script_process.state})
         config = mm.config_cache(script_name)
-        config.get_next()
-        await script_process.send_json(websocket, {"schedule": config.get_schedule_data()})
+        await script_process.send_json(websocket, {"schedule": connection_schedule(config)})
 
         while True:
             # 初次进入，广播state schedule
@@ -221,8 +233,7 @@ async def websocket_endpoint(websocket: WebSocket, script_name: str):
                 await script_process.broadcast_state({"state": script_process.state})
             elif data == 'get_schedule':
                 config = mm.config_cache(script_name)
-                config.get_next()
-                await script_process.broadcast_state({"schedule": config.get_schedule_data()})
+                await script_process.broadcast_state({"schedule": connection_schedule(config)})
             elif data == 'start':
                 await script_process.start()
             elif data == 'stop':

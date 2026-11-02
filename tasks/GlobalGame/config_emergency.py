@@ -17,6 +17,7 @@ class FriendInvitation(str, Enum):
 
 class WhenNetworkAbnormal(str, Enum):
     RESTART = 'restart'
+    WAIT_5S = 'wait_5s'
     WAIT_10S = 'wait_10s'
 
 class WhenNetworkError(str, Enum):
