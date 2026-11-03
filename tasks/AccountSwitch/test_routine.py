@@ -15,10 +15,14 @@ from tasks.AccountSwitch.config import (
     JadePeriodProgress,
 )
 from tasks.AccountSwitch.routine import (
+    arm_future,
+    finish,
+    next_due,
     next_routine_run,
     next_scheduled_run,
     period_run_time,
     refresh_period,
+    request_run_now,
 )
 
 
@@ -134,6 +138,29 @@ class RoutineScheduleTests(unittest.TestCase):
         ]:
             with self.subTest(field=field, value=value), self.assertRaises(ValidationError):
                 AccountSwitchConfig(**{field: value})
+
+
+class ImmediateRoutineTests(unittest.TestCase):
+    def test_manual_run_advances_current_slot_and_survives_service_start(self):
+        now = datetime(2026, 11, 3, 18, 10)
+        settings = AccountSwitchConfig(routine_enable=True, evening_run_time=time(20))
+        runtime = AccountRoutineState()
+        arm_future(runtime, settings, 'android', now)
+        self.assertIsNone(next_due(runtime, settings, now))
+        appointment = request_run_now(runtime, settings, now)
+        self.assertEqual(appointment['plan'], 'evening')
+        self.assertEqual(appointment['at'], now.isoformat())
+        arm_future(runtime, settings, 'android', now)
+        self.assertEqual(next_due(runtime, settings, now)['kind'], 'manual')
+        finish(runtime, settings, 'android', now)
+        self.assertIsNone(request_run_now(runtime, settings, now))
+
+    def test_manual_request_cannot_cross_jade_refresh_boundary(self):
+        now = datetime(2026, 11, 3, 17, 59)
+        settings = AccountSwitchConfig(routine_enable=True, evening_run_time=time(20))
+        runtime = AccountRoutineState()
+        self.assertEqual(request_run_now(runtime, settings, now)['plan'], 'daytime')
+        self.assertIsNone(next_due(runtime, settings, datetime(2026, 11, 3, 18)))
 
 
 class RoutinePersistenceTests(unittest.TestCase):

@@ -26,6 +26,15 @@ class GameStartupTests(unittest.TestCase):
         self.device.app_start.assert_not_called()
         self.device.wait_app_start_ready.assert_not_called()
 
+    def test_uiautomator_failure_uses_adb_to_confirm_foreground_game(self):
+        device = Mock(spec=['app_is_running', 'app_start', 'app_current_adb', 'package'])
+        device.package = 'com.example.game'
+        device.app_is_running.side_effect = RequestHumanTakeover('forward failed')
+        device.app_current_adb.return_value = device.package
+        service.ensure_game_started(device)
+        device.app_current_adb.assert_called_once_with()
+        device.app_start.assert_not_called()
+
     def test_older_device_without_readiness_method_is_supported(self):
         device = Mock(spec=['app_is_running', 'app_start'])
         device.app_is_running.side_effect = [False, True]

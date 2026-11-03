@@ -129,6 +129,26 @@ def _plans(platform):
     return ('ios_daily',) if platform == 'ios' else ('daytime', 'evening')
 
 
+def request_run_now(runtime, settings, now: datetime) -> dict | None:
+    """Advance one unfinished batch in the current refresh window."""
+    with _lock:
+        records = _schedule(runtime)
+        platforms = sorted(('android', 'ios'), key=lambda platform: platform != settings.platform_priority)
+        for platform in platforms:
+            enabled = settings.routine_enable if platform == 'android' else settings.ios_daily_enable
+            if not enabled:
+                continue
+            plan, start, _ = window(now, platform)
+            if sample(runtime, settings, plan, start.date())['state'] in ('done', 'running'):
+                continue
+            appointment = {'kind': 'manual', 'plan': plan, 'day': start.date().isoformat(),
+                           'at': now.isoformat()}
+            records.setdefault('service:' + platform, {'armed_at': now.isoformat()})
+            records[platform] = appointment
+            return dict(appointment)
+        return None
+
+
 def arm_future(runtime, settings, platform: str, now: datetime) -> dict:
     """An enabled/restarted service never automatically catches up old slots.
 
@@ -138,7 +158,12 @@ def arm_future(runtime, settings, platform: str, now: datetime) -> dict:
     """
     with _lock:
         records = _schedule(runtime)
-        _, start, _ = window(now, platform)
+        active, start, end = window(now, platform)
+        manual = records.get(platform, {})
+        if (manual.get('kind') == 'manual' and manual.get('plan') == active
+                and manual.get('day') == start.date().isoformat()
+                and (at := _parse(manual.get('at'))) is not None and start <= at < end):
+            return dict(manual)
         records['service:' + platform] = {'armed_at': now.isoformat()}
         records[platform] = {}
         for plan in _plans(platform):
@@ -165,10 +190,11 @@ def resolve(runtime, settings, platform: str, now: datetime) -> dict:
             return arm_future(runtime, settings, platform, now)
         active, start, end = window(now, platform)
         meta = records.get(platform, {})
-        retry = _parse(meta.get('at')) if isinstance(meta, dict) and meta.get('kind') == 'retry' else None
-        if (retry is not None and meta.get('plan') == active and meta.get('day') == start.date().isoformat()
-                and start <= retry < end):
-            return dict(meta)
+        if isinstance(meta, dict) and meta.get('kind') in ('retry', 'manual'):
+            at = _parse(meta.get('at'))
+            if (at is not None and meta.get('plan') == active
+                    and meta.get('day') == start.date().isoformat() and start <= at < end):
+                return dict(meta)
         candidates = []
         for offset in (0, 1, 2):
             day = start.date() + timedelta(days=offset)
@@ -237,4 +263,6 @@ def next_due(runtime, settings, now: datetime) -> dict | None:
             value = {'platform': platform, **resolve(runtime, settings, platform, now)}
             if _parse(value['at']) <= now:
                 candidates.append(value)
-    return min(candidates, key=lambda value: (value['platform'] != settings.platform_priority, value['at'])) if candidates else None
+    return min(candidates, key=lambda value: (
+        value['kind'] != 'manual', value['platform'] != settings.platform_priority, value['at']
+    ), default=None)

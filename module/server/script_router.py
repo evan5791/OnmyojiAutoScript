@@ -14,6 +14,7 @@ from module.exception import RequestHumanTakeover
 from module.server.main_manager import mm
 from module.server.script_process import ScriptProcess, ScriptState
 
+from tasks.AccountSwitch.routine import request_run_now
 from tasks.Component.config_base import TimeDelta
 
 
@@ -165,7 +166,27 @@ async def script_task(script_name: str, task: str, group: str, argument: str, ty
     except Exception as e:
         # 类型不正确
         raise HTTPException(status_code=400, detail=f'Argument type error: {e}')
-    return mm.config_cache(script_name).model.script_set_arg(task, group, argument, value)
+    config = mm.config_cache(script_name)
+    if (convert_to_underscore(task) == 'account_switch' and group == 'scheduler'
+            and argument == 'next_run' and types == 'next_run'):
+        try:
+            requested = datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail='Invalid next_run') from exc
+        now = datetime.now()
+        block = config.model.account_switch
+        settings = block.account_switch_config
+        if requested <= now and (settings.routine_enable or settings.ios_daily_enable):
+            if not block.scheduler.enable:
+                raise HTTPException(status_code=409, detail='请先启用小号切换任务')
+            appointment = request_run_now(block.runtime, settings, now)
+            if appointment is None:
+                raise HTTPException(status_code=409, detail='当前时段已完成，或小号任务正在执行')
+            block.scheduler.next_run = now
+            config.save()
+            logger.info(f'小号立即启动：{appointment["plan"]} / {appointment["day"]}')
+            return True
+    return config.model.script_set_arg(task, group, argument, value)
 
 
 @script_app.put('/{script_name}/{task}/sync_next_run')

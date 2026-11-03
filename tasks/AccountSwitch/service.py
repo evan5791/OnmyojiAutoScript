@@ -22,11 +22,24 @@ def _log(logger, message):
 
 def ensure_game_started(device, logger=None) -> None:
     """Launch a closed game; AccountSwitch owns account selection and login."""
+    app_is_running = device.app_is_running
     try:
-        if device.app_is_running():
+        if app_is_running():
             return
     except RequestHumanTakeover as exc:
-        raise GameNotRunningError('Cannot query game state before AccountSwitch') from exc
+        adb_probe = getattr(device, 'app_current_adb', None)
+        if not callable(adb_probe):
+            raise GameNotRunningError('Cannot query game state before AccountSwitch') from exc
+
+        def app_is_running():
+            try:
+                return adb_probe().strip() == device.package
+            except RequestHumanTakeover as adb_error:
+                raise GameNotRunningError('Cannot query game state before AccountSwitch via ADB') from adb_error
+
+        _log(logger, '小号启动状态检测改用 ADB 前台查询')
+        if app_is_running():
+            return
     _log(logger, '小号切换前游戏未运行，启动游戏后交由小号流程校验登录')
     device.app_start()
     wait_ready = getattr(device, 'wait_app_start_ready', None)
@@ -35,7 +48,7 @@ def ensure_game_started(device, logger=None) -> None:
     # Older OAS devices have no startup-frame probe. Allow the asynchronous
     # foreground transition to finish before the shell takes its first frame.
     deadline = monotonic() + 15
-    while not device.app_is_running():
+    while not app_is_running():
         if monotonic() >= deadline:
             raise GameNotRunningError('Game did not start before AccountSwitch')
         sleep(0.5)
